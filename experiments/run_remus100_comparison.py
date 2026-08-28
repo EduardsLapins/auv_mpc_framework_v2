@@ -1,0 +1,836 @@
+"""
+Full REMUS 100 experiment suite — Fossen PID/SMC vs tuned PID vs NMPC.
+All figure text is looked up via config.T() to support English / Latvian output.
+
+Changes from the original version
+----------------------------------
+1. NMPC is now a trajectory NMPC: the optimiser receives the full future reference
+   over the horizon, not only the current setpoint.
+2. make_nmpc() reads USE_PATCHED_NMPC from config.py to choose between the
+   original (N=20) and patched offset-free (N=30) variant.
+3. Reference uses minimum-jerk / S-curve transitions with rate limits, which
+   avoids impulsive reference rates at waypoint boundaries.
+4. Reference includes theta_ref, q_ref, r_ref so NMPC does not penalise yaw
+   rate as zero during heading changes.
+5. Heading plots are drawn as continuous (unwrapped) angles.
+6. Scenario 6 exports a heading-error CSV and a 6-panel comparison figure.
+"""
+
+from __future__ import annotations
+
+import csv
+import math
+import os
+import sys
+from typing import Iterable
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from adapters.fossen_adapter import FossenVehicleAdapter
+from config import T, USE_PATCHED_NMPC
+
+D2R = math.pi / 180.0
+R2D = 180.0 / math.pi
+COLORS = {
+    "Fossen PID/SMC": "#e74c3c",
+    "PID (tuned)":    "#3498db",   # 50 Hz — standard embedded rate
+    "PID (5 Hz)":     "#e67e22",   # 5 Hz — rate-matched to NMPC
+}
+NMPC_COLOR = "#27ae60"
+
+
+def _color(name: str) -> str:
+    return COLORS.get(name, NMPC_COLOR)
+
+
+def _ssa(angle: float) -> float:
+    """Smallest signed angle in radians, scalar version."""
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _wrap_to_pi(angle):
+    """Smallest signed angle in radians, scalar or NumPy array."""
+    return np.arctan2(np.sin(angle), np.cos(angle))
+
+
+def _angle_delta(start_rad: float, target_rad: float) -> float:
+    """Shortest angular delta from start to target.
+
+    For the exact 180 deg case, choose +pi instead of -pi so a labelled
+    0 -> 180 deg step is plotted in the intuitive positive direction.
+    """
+    d = _ssa(target_rad - start_rad)
+    if abs(d + math.pi) < 1e-12:
+        d = math.pi
+    return d
+
+
+def heading_deg(angle_rad) -> np.ndarray:
+    """Convert radian heading to compass degrees [0, 360)."""
+    return np.mod(np.degrees(angle_rad), 360.0)
+
+
+def heading_continuous_deg(angle_rad, *, anchor_deg: float = 0.0) -> np.ndarray:
+    """Unwrap a heading time series into a continuous degree signal.
+
+    A compass heading of -1 deg and 359 deg is physically the same direction,
+    but plotting it as [0, 360) makes the graph jump from the bottom to the
+    top.  This function preserves physical continuity instead:
+
+        0, -1, -2, ...        instead of      0, 359, 358, ...
+        330, 360, 405         instead of      330, 0, 45
+    """
+    y = np.degrees(np.unwrap(np.asarray(angle_rad, dtype=float)))
+    if y.size:
+        y = y + 360.0 * round((anchor_deg - y[0]) / 360.0)
+    return y
+
+
+def heading_error_deg(eta_psi, eta_d_psi) -> np.ndarray:
+    """Signed heading tracking error in degrees, wrapped to [-180, 180]."""
+    return np.degrees(_wrap_to_pi(np.asarray(eta_psi) - np.asarray(eta_d_psi)))
+
+
+def plot_heading_continuous(ax, time, angle_rad, *, label, color, lw=1.5, ls="-",
+                            alpha=1.0, anchor_deg: float = 0.0):
+    """Plot heading as a continuous signal instead of compass-modulo [0, 360)."""
+    y = heading_continuous_deg(angle_rad, anchor_deg=anchor_deg)
+    ax.plot(time, y, color=color, label=label, lw=lw, ls=ls, alpha=alpha)
+
+
+# Backwards-compatible alias.
+def plot_heading_line(ax, time, angle_rad, *, label, color, lw=1.5, ls="-", alpha=1.0):
+    plot_heading_continuous(ax, time, angle_rad, label=label, color=color,
+                            lw=lw, ls=ls, alpha=alpha)
+
+
+def make_nmpc(V_c: float = 0.0, beta_c: float = 0.0):
+    """Build the NMPC controller, using the variant set in config.py."""
+    from python_vehicle_simulator.vehicles.remus100 import remus100
+    v = remus100("stepInput", V_current=V_c, beta_current=beta_c)
+    if USE_PATCHED_NMPC:
+        from controllers.nmpc_remus_patched import NMPC_REMUS100_Patched
+        nmpc = NMPC_REMUS100_Patched(v, N=30, n_rpm=1525)
+    else:
+        from controllers.nmpc_remus import NMPC_REMUS100
+        nmpc = NMPC_REMUS100(v, N=20, n_rpm=1525)
+    nmpc.set_current_estimate(V_c, beta_c * D2R)
+    return nmpc
+
+
+def make_pid():
+    from controllers.pid_remus import PID_REMUS100
+    return PID_REMUS100(n_rpm=1525)
+
+
+def wrap_nmpc(nmpc, reference_fn=None, dt_mpc: float = 0.2):
+    """Wrap NMPC to run at a slower MPC rate than the 50 Hz simulator.
+
+    reference_fn is passed into the controller so the NLP can sample the
+    future reference at t, t+dt, ..., t+N*dt.
+    """
+    if hasattr(nmpc, "set_reference_provider"):
+        nmpc.set_reference_provider(reference_fn)
+
+    last_t = [-1.0]
+    last_u = [np.array([0.0, 0.0, nmpc.n_rpm], dtype=float)]
+
+    def fn(eta, nu, eta_d, nu_d, t):
+        if t - last_t[0] >= dt_mpc - 1e-9:
+            last_u[0] = nmpc.compute(eta, nu, eta_d, nu_d, t)
+            last_t[0] = t
+        return last_u[0]
+
+    fn.name = nmpc.name
+    fn.solve_times = nmpc.solve_times
+    return fn
+
+
+def wrap_pid(pid):
+    """Wrap PID at full 50 Hz simulator rate."""
+    def fn(eta, nu, eta_d, nu_d, t):
+        return pid.compute(eta, nu, eta_d, nu_d, t)
+
+    fn.name = pid.name
+    fn.solve_times = pid.solve_times
+    return fn
+
+
+def wrap_pid_5hz(pid, dt_mpc: float = 0.2):
+    """Wrap PID as a true 5 Hz controller (matches NMPC update rate).
+
+    Unlike a ZOH wrapper, this only calls compute() once per dt_mpc second,
+    passing dt=dt_mpc so the integral and reference smoothing step correctly.
+    The integral accumulation rate is mathematically identical to 50 Hz
+    for dynamics slower than 5 Hz (which applies to REMUS 100 heading/depth).
+    """
+    last_t = [-1.0]
+    last_u = [None]
+
+    def fn(eta, nu, eta_d, nu_d, t):
+        if t - last_t[0] >= dt_mpc - 1e-9:
+            u = pid.compute(eta, nu, eta_d, nu_d, t, dt=dt_mpc)
+            last_u[0] = u.copy()
+            last_t[0] = t
+        return last_u[0] if last_u[0] is not None else pid.compute(eta, nu, eta_d, nu_d, t, dt=dt_mpc)
+
+    fn.name = pid.name + " (5 Hz)"
+    fn.solve_times = pid.solve_times
+    return fn
+
+
+def wrap_pid_hz(pid, dt: float):
+    """Run PID at any rate by passing the matching dt to compute().
+
+    Use with sampleTime=dt in adapter.run() so the simulation steps and
+    the PID update are synchronised (call compute() once per physics step).
+    """
+    def fn(eta, nu, eta_d, nu_d, t):
+        return pid.compute(eta, nu, eta_d, nu_d, t, dt=dt)
+    fn.name = pid.name
+    fn.solve_times = pid.solve_times
+    return fn
+
+
+def downsample_result(r, factor: int):
+    """Return a new SimulationResult keeping every `factor`-th time step.
+
+    Used to bring a high-rate run (e.g. 500 Hz) back to the standard 50 Hz
+    grid so it can be saved alongside other results in the same CSV.
+    """
+    from adapters.fossen_adapter import SimulationResult
+    idx = np.arange(0, len(r.time), factor)
+    return SimulationResult(
+        time=r.time[idx],
+        eta=r.eta[idx],
+        nu=r.nu[idx],
+        u_control=r.u_control[idx],
+        u_actual=r.u_actual[idx],
+        eta_d=r.eta_d[idx],
+        controller_name=r.controller_name,
+        solve_times=r.solve_times,
+    )
+
+
+def _minimum_jerk(s: float) -> tuple[float, float, float]:
+    """Return alpha, d(alpha)/ds, d2(alpha)/ds2 for 10s^3-15s^4+6s^5."""
+    s = max(0.0, min(1.0, float(s)))
+    a = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
+    da = 30.0 * s**2 - 60.0 * s**3 + 30.0 * s**4
+    dda = 60.0 * s - 180.0 * s**2 + 120.0 * s**3
+    return a, da, dda
+
+
+def _transition_duration(
+    z0: float,
+    z1: float,
+    psi0: float,
+    psi1: float,
+    tau_rise: float,
+    *,
+    z_rate_max: float,
+    psi_rate_max: float,
+) -> float:
+    """Choose an S-curve duration that respects approximate peak rates."""
+    dz = abs(float(z1) - float(z0))
+    dpsi = abs(_angle_delta(float(psi0), float(psi1)))
+    T_base = max(0.1, 2.5 * float(tau_rise))
+    T_z = 1.875 * dz / max(z_rate_max, 1e-6)
+    T_psi = 1.875 * dpsi / max(psi_rate_max, 1e-6)
+    return max(T_base, T_z, T_psi, 0.1)
+
+
+def smooth_ref(
+    targets: list[tuple[float, float]],
+    switch_times: list[float],
+    tau_rise: float = 10.0,
+    *,
+    u_ref: float = 2.5,
+    z_rate_max: float = 1.0,
+    psi_rate_max_deg: float = 5.0,
+    theta_max_deg: float = 18.0,
+    q_ref_max_deg_s: float = 10.0,
+    r_ref_max_deg_s: float = 8.0,
+):
+    """Create a physically smooth depth/heading reference.
+
+    targets are (depth_m, heading_deg).  The heading is interpolated on the
+    shortest angular path, and the transition profile is minimum-jerk.
+    """
+    if len(targets) != len(switch_times) + 1:
+        raise ValueError("targets length must be switch_times length + 1")
+
+    psi_rate_max = psi_rate_max_deg * D2R
+    theta_max = theta_max_deg * D2R
+    q_ref_max = q_ref_max_deg_s * D2R
+    r_ref_max = r_ref_max_deg_s * D2R
+
+    durations = []
+    for i in range(1, len(targets)):
+        z0, psi0_deg = targets[i - 1]
+        z1, psi1_deg = targets[i]
+        durations.append(
+            _transition_duration(
+                z0, z1, psi0_deg * D2R, psi1_deg * D2R, tau_rise,
+                z_rate_max=z_rate_max, psi_rate_max=psi_rate_max,
+            )
+        )
+
+    def ref(t: float):
+        z_d, psi_deg = targets[0]
+        psi_rad = psi_deg * D2R
+        z_dot = 0.0
+        z_ddot = 0.0
+
+        for i in range(1, len(targets)):
+            t_switch = switch_times[i - 1]
+            if t >= t_switch:
+                z0, psi0_deg = targets[i - 1]
+                z1, psi1_deg = targets[i]
+                psi0 = psi0_deg * D2R
+                psi1 = psi1_deg * D2R
+                dz = z1 - z0
+                dpsi = _angle_delta(psi0, psi1)
+
+                T = durations[i - 1]
+                s_loc = (float(t) - t_switch) / T
+                alpha, dalpha_ds, ddalpha_ds2 = _minimum_jerk(s_loc)
+                alpha_dot = dalpha_ds / T if 0.0 <= s_loc <= 1.0 else 0.0
+                alpha_ddot = ddalpha_ds2 / (T * T) if 0.0 <= s_loc <= 1.0 else 0.0
+
+                z_d = z0 + dz * alpha
+                z_dot = dz * alpha_dot
+                z_ddot = dz * alpha_ddot
+                psi_rad = _ssa(psi0 + dpsi * alpha)
+                psi_dot = float(np.clip(dpsi * alpha_dot, -r_ref_max, r_ref_max))
+
+        u_safe = max(abs(u_ref), 0.3)
+        theta_arg = float(np.clip(-z_dot / u_safe, -math.sin(theta_max), math.sin(theta_max)))
+        theta_ref = math.asin(theta_arg)
+
+        denom = max(1e-3, math.sqrt(max(1e-6, 1.0 - theta_arg * theta_arg)))
+        q_ref = (-z_ddot / u_safe) / denom
+        q_ref = float(np.clip(q_ref, -q_ref_max, q_ref_max))
+
+        # psi_dot may have been overwritten in the loop; guard against UnboundLocalError
+        try:
+            psi_dot  # noqa: B018
+        except NameError:
+            psi_dot = 0.0
+
+        eta_d = np.array([0.0, 0.0, z_d, 0.0, theta_ref, psi_rad], dtype=float)
+        nu_d = np.array([u_ref, 0.0, z_dot, 0.0, q_ref, psi_dot], dtype=float)
+        return eta_d, nu_d
+
+    ref.transition_durations = durations
+    return ref
+
+
+def tracking_errors(result):
+    """Return tracking error arrays and summary statistics for one result."""
+    if result.eta_d is None:
+        raise ValueError("result.eta_d is required for tracking error analysis")
+
+    e_z = result.eta[:, 2] - result.eta_d[:, 2]
+    e_psi_rad = _wrap_to_pi(result.eta[:, 5] - result.eta_d[:, 5])
+    e_psi_deg = np.degrees(e_psi_rad)
+    dt = result.time[1] - result.time[0] if len(result.time) > 1 else 0.02
+
+    return {
+        "e_z": e_z,
+        "abs_e_z": np.abs(e_z),
+        "e_psi_rad": e_psi_rad,
+        "e_psi_deg": e_psi_deg,
+        "abs_e_psi_deg": np.abs(e_psi_deg),
+        "cum_abs_z": np.cumsum(np.abs(e_z)) * dt,
+        "cum_abs_psi_deg": np.cumsum(np.abs(e_psi_deg)) * dt,
+        "dt": dt,
+        "z_rmse": float(np.sqrt(np.mean(e_z**2))),
+        "z_mae": float(np.mean(np.abs(e_z))),
+        "z_iae": float(np.sum(np.abs(e_z)) * dt),
+        "psi_rmse_deg": float(np.sqrt(np.mean(e_psi_deg**2))),
+        "psi_mae_deg": float(np.mean(np.abs(e_psi_deg))),
+        "psi_max_deg": float(np.max(np.abs(e_psi_deg))),
+        "psi_iae_deg_s": float(np.sum(np.abs(e_psi_deg)) * dt),
+    }
+
+
+def compute_metrics(result, tz: float | None = None, tp_deg: float | None = None,
+                    t0: float = 50.0):
+    """Simple final-target metrics for scenarios 1-5."""
+    mask = result.time >= t0
+    if not mask.any():
+        mask = np.ones(len(result.time), dtype=bool)
+
+    if tz is None and result.eta_d is not None:
+        z_ref = result.eta_d[:, 2]
+    else:
+        z_ref = np.full_like(result.time, float(tz))
+
+    if tp_deg is None and result.eta_d is not None:
+        psi_ref = result.eta_d[:, 5]
+    else:
+        psi_ref = np.full_like(result.time, float(tp_deg) * D2R)
+
+    ze = result.eta[mask, 2] - z_ref[mask]
+    pe = _wrap_to_pi(result.eta[mask, 5] - psi_ref[mask])
+    return {
+        "z_rmse": float(np.sqrt(np.mean(ze**2))),
+        "psi_rmse_deg": float(np.degrees(np.sqrt(np.mean(pe**2)))),
+    }
+
+
+def plot_scenario(results, path: str, title: str, tz: float | None = None,
+                  tp: float | None = None):
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+
+    for r in results:
+        c = _color(r.controller_name)
+        axes[0].plot(r.time, r.eta[:, 2], color=c, label=r.controller_name, lw=1.5)
+        plot_heading_continuous(axes[1], r.time, r.eta[:, 5], label=r.controller_name,
+                                color=c, lw=1.5, anchor_deg=0.0)
+        spd = np.sqrt(np.sum(r.nu[:, :3] ** 2, axis=1))
+        axes[2].plot(r.time, spd, color=c, label=r.controller_name, lw=1.5)
+
+    if tz is not None:
+        axes[0].axhline(y=tz, color="gray", ls="--", alpha=0.5, label=T("target"))
+    if tp is not None:
+        axes[1].axhline(y=tp, color="gray", ls="--", alpha=0.5, label=T("target"))
+
+    axes[0].set_ylabel(T("depth_m"))
+    axes[0].set_title(T("depth_tracking"))
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].set_ylabel(T("heading_deg"))
+    axes[1].set_title(T("heading_tracking"))
+    axes[1].margins(y=0.08)
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].set_ylabel(T("speed_ms"))
+    axes[2].set_xlabel(T("time_s"))
+    axes[2].set_title(T("speed"))
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    print(f"    Saved: {path}")
+    plt.close()
+
+
+def run_three(t_final, z_d, psi_d, Vc, bc, ref, tag, out, title):
+    results = []
+
+    print("    Fossen autopilot...")
+    a = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
+    r1 = a.run_builtin_autopilot(t_final, z_d, psi_d, 1525, Vc, bc)
+    r1.controller_name = "Fossen PID/SMC"
+    results.append(r1)
+
+    print("    Tuned PID (50 Hz)...")
+    pid = make_pid()
+    a2 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
+    r2 = a2.run(t_final, wrap_pid(pid), ref, sampleTime=0.02)
+    r2.controller_name = "PID (tuned)"
+    results.append(r2)
+
+    print("    NMPC...")
+    nmpc = make_nmpc(Vc, bc)
+    a3 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
+    r3 = a3.run(t_final, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02)
+    r3.controller_name = nmpc.name
+    results.append(r3)
+
+    for r in results:
+        m = compute_metrics(r, z_d, psi_d)
+        print(f"      {r.controller_name:28s}: z_RMSE={m['z_rmse']:.3f} m, "
+              f"psi_RMSE={m['psi_rmse_deg']:.2f} deg")
+
+    plot_scenario(results, f"{out}/{tag}.png", title, z_d, psi_d)
+    return results
+
+
+def scenario_1(out):
+    print("\n" + "=" * 70 + "\n  SCENARIO 1: Standard depth+heading (Vc=0.5)\n" + "=" * 70)
+    return run_three(
+        200, 30, 50, 0.5, 170,
+        smooth_ref([(0, 0), (30, 50)], [2.0]),
+        "s1_standarts", out,
+        T("s1_title"),
+    )
+
+
+def scenario_2(out):
+    print("\n" + "=" * 70 + "\n  SCENARIO 2: Disturbed environment\n" + "=" * 70)
+    for Vc, bc in [(0.0, 0), (0.5, 170), (1.0, 170)]:
+        print(f"\n  Current: {Vc} m/s @ {bc} deg")
+        tag = f"s2_Vc{Vc:.1f}".replace(".", "_")
+        run_three(
+            200, 30, 50, Vc, bc,
+            smooth_ref([(0, 0), (30, 50)], [2.0]),
+            tag, out,
+            T("s2_title").format(vc=Vc),
+        )
+
+
+def scenario_3(out):
+    print("\n" + "=" * 70 + "\n  SCENARIO 3: Large heading changes\n" + "=" * 70)
+    for pd in [90, 180]:
+        print(f"\n  Heading: 0 -> {pd} deg")
+        run_three(
+            200, 20, pd, 0.3, 90,
+            smooth_ref([(0, 0), (20, pd)], [2.0], tau_rise=15.0),
+            f"s3_kurss{pd}", out,
+            T("s3_title").format(pd=pd),
+        )
+
+
+def scenario_4(out):
+    print("\n" + "=" * 70 + "\n  SCENARIO 4: Multi-waypoint mission\n" + "=" * 70)
+    ref = smooth_ref([(0, 0), (20, 30), (40, 120), (20, 30)], [5.0, 100.0, 200.0],
+                     tau_rise=15.0)
+    nmpc = make_nmpc(0.5, 170)
+    a = FossenVehicleAdapter(V_current=0.5, beta_current=170)
+    r = a.run(400, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02)
+    r.controller_name = nmpc.name
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    fig.suptitle(T("s4_title").format(name=r.controller_name),
+                 fontsize=14, fontweight="bold")
+
+    axes[0].plot(r.time, r.eta[:, 2], "g-",
+                 label=f"{r.controller_name} {T('depth_label')}", lw=1.5)
+    axes[0].plot(r.time, r.eta_d[:, 2], "k--", label=T("reference"), lw=1, alpha=0.6)
+    axes[0].set_ylabel(T("depth_m"))
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    plot_heading_continuous(axes[1], r.time, r.eta[:, 5],
+                            label=f"{r.controller_name} {T('heading_label')}", color="g", lw=1.5,
+                            anchor_deg=0.0)
+    plot_heading_continuous(axes[1], r.time, r.eta_d[:, 5],
+                            label=T("reference"), color="k", lw=1, ls="--", alpha=0.6,
+                            anchor_deg=0.0)
+    axes[1].set_ylabel(T("heading_deg"))
+    axes[1].set_xlabel(T("time_s"))
+    axes[1].margins(y=0.08)
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = f"{out}/s4_daudzpunkti.png"
+    plt.savefig(path, dpi=200)
+    print(f"    Saved: {path}")
+    plt.close()
+
+
+def scenario_5(out):
+    print("\n" + "=" * 70 + "\n  SCENARIO 5: Aggressive descent 0->50m\n" + "=" * 70)
+    return run_three(
+        150, 50, 0, 0.0, 0,
+        smooth_ref([(0, 0), (50, 0)], [2.0], tau_rise=5.0),
+        "s5_descent", out,
+        T("s5_title"),
+    )
+
+
+def _segment_bounds(switch_times: Iterable[float], t_final: float):
+    return [0.0, *list(switch_times), float(t_final)]
+
+
+def print_heading_segment_analysis(result, switch_times, t_final, *, top_n: int = 4):
+    errs = tracking_errors(result)
+    rows = []
+    bounds = _segment_bounds(switch_times, t_final)
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        mask = (result.time >= a) & (result.time < b)
+        if not mask.any():
+            continue
+        dt = errs["dt"]
+        abs_e = errs["abs_e_psi_deg"][mask]
+        rows.append(
+            {
+                "segment": f"{a:.0f}-{b:.0f}s",
+                "iae": float(np.sum(abs_e) * dt),
+                "mae": float(np.mean(abs_e)),
+                "max": float(np.max(abs_e)),
+            }
+        )
+
+    rows.sort(key=lambda x: x["iae"], reverse=True)
+    print(f"\n    {result.controller_name} — worst heading error segments:")
+    for row in rows[:top_n]:
+        print(
+            f"      {row['segment']:>9s}: int|e_psi|dt={row['iae']:7.1f} deg*s, "
+            f"MAE={row['mae']:5.2f} deg, max={row['max']:5.2f} deg"
+        )
+
+
+def save_s6_heading_error_csv(results, out: str) -> str:
+    """Save time-history of heading and heading error for scenario 6."""
+    path = os.path.join(out, "s6_kursa_kludas_analize.csv")
+    base = results[0]
+    ref_cont = heading_continuous_deg(base.eta_d[:, 5], anchor_deg=0.0)
+    result_cont = {id(r): heading_continuous_deg(r.eta[:, 5], anchor_deg=0.0)
+                   for r in results}
+
+    headers = ["time_s", "reference_heading_deg", "reference_heading_continuous_deg"]
+    for r in results:
+        safe = (r.controller_name
+                .replace(" ", "_")
+                .replace("(", "").replace(")", "")
+                .replace("=", "").replace("-", "-"))
+        headers += [
+            f"{safe}_heading_deg",
+            f"{safe}_heading_continuous_deg",
+            f"{safe}_heading_error_deg",
+        ]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for i, t in enumerate(base.time):
+            row = [
+                f"{t:.3f}",
+                f"{heading_deg(base.eta_d[i, 5]):.6f}",
+                f"{ref_cont[i]:.6f}",
+            ]
+            for r in results:
+                row.append(f"{heading_deg(r.eta[i, 5]):.6f}")
+                row.append(f"{result_cont[id(r)][i]:.6f}")
+                row.append(f"{heading_error_deg(r.eta[i, 5], r.eta_d[i, 5]):.6f}")
+            writer.writerow(row)
+
+    print(f"    Saved: {path}")
+    return path
+
+
+def scenario_6_complex(out):
+    """SCENARIO 6: complex 8-segment mission (600 s) — long-horizon comparison."""
+    print("\n" + "=" * 70)
+    print("  SCENARIO 6: Complex trajectory (600 s mission)")
+    print("  8 segments, current 0.6 m/s @ 150 deg")
+    print("=" * 70)
+
+    Vc = 0.6
+    bc = 150
+    t_final = 600.0
+    waypoints = [(0, 0), (15, 0), (25, 90), (40, 90), (40, 200),
+                 (10, 200), (30, 330), (45, 45), (20, 0)]
+    switch_times = [5, 60, 120, 180, 260, 340, 420, 500]
+    # z_rate_max capped at u_ref * sin(theta_max) ≈ 2.5 * sin(25°) ≈ 1.05 m/s.
+    # Without this limit the S-curve commands depth rates up to 2 m/s (pitch ~53°),
+    # far above the NMPC predictor's pitch constraint (25°), causing a large
+    # pitch→yaw coupling mismatch that neither the model nor the observer can cancel.
+    ref = smooth_ref(waypoints, switch_times, tau_rise=12.0, z_rate_max=1.0)
+    results = []
+
+    # PID at 50 Hz — standard embedded-system rate
+    print("    PID (50 Hz)...")
+    pid_50 = make_pid()
+    a_pid50 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
+    r_pid50 = a_pid50.run(t_final, wrap_pid(pid_50), ref, sampleTime=0.02)
+    r_pid50.controller_name = "PID (tuned)"
+    results.append(r_pid50)
+
+    # PID at 5 Hz — rate-matched to NMPC (same gains, slower feedback loop)
+    print("    PID (5 Hz) — rate-matched to NMPC...")
+    pid_5 = make_pid()
+    a_pid5 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
+    r_pid5 = a_pid5.run(t_final, wrap_pid_5hz(pid_5), ref, sampleTime=0.02)
+    r_pid5.controller_name = "PID (5 Hz)"
+    results.append(r_pid5)
+
+    # NMPC at 5 Hz — constrained by solver time (~25 ms / call)
+    print("    NMPC (5 Hz)...")
+    nmpc = make_nmpc(Vc, bc)
+    a3 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
+    r3 = a3.run(t_final, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02)
+    r3.controller_name = nmpc.name
+    results.append(r3)
+
+    print("\n  Cumulative tracking errors:")
+    for r in results:
+        e = tracking_errors(r)
+        print(
+            f"    {r.controller_name:28s}: "
+            f"int|e_z|dt={e['z_iae']:7.1f} m*s, z_RMSE={e['z_rmse']:5.2f} m, "
+            f"int|e_psi|dt={e['psi_iae_deg_s']:8.1f} deg*s, "
+            f"psi_RMSE={e['psi_rmse_deg']:5.2f} deg, "
+            f"psi_MAE={e['psi_mae_deg']:5.2f} deg, max={e['psi_max_deg']:5.2f} deg"
+        )
+        print_heading_segment_analysis(r, switch_times, t_final)
+
+    save_s6_heading_error_csv(results, out)
+
+    # Save controller solve times for computational performance analysis.
+    # NMPC runs at 5 Hz (dt_mpc=0.2 s); PID runs at 50 Hz (sampleTime=0.02 s).
+    times_path = os.path.join(out, "nmpc_solve_times_s6.csv")
+    with open(times_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["call_index", "mission_time_s",
+                    "nmpc_solve_time_ms", "pid50_solve_time_ms", "pid5_solve_time_ms"])
+        n_nmpc  = len(nmpc.solve_times)
+        n_pid50 = len(pid_50.solve_times)
+        n_pid5  = len(pid_5.solve_times)
+        # One row per NMPC call (every 0.2 s = 5 Hz).
+        # PID-50: 10 calls per row; PID-5: 1 call per row.
+        n_rows = max(n_nmpc, n_pid50 // 10 if n_pid50 else 0, n_pid5)
+        for i in range(n_rows):
+            t_s = i * 0.2
+            nmpc_ms = nmpc.solve_times[i] * 1000 if i < n_nmpc else ""
+
+            sl50 = pid_50.solve_times[i * 10:(i + 1) * 10]
+            pid50_ms = float(np.mean(sl50)) * 1000 if sl50 else ""
+
+            pid5_ms = pid_5.solve_times[i] * 1000 if i < n_pid5 else ""
+
+            w.writerow([
+                i, f"{t_s:.3f}",
+                f"{nmpc_ms:.4f}"  if nmpc_ms  != "" else "",
+                f"{pid50_ms:.4f}" if pid50_ms != "" else "",
+                f"{pid5_ms:.4f}"  if pid5_ms  != "" else "",
+            ])
+    print(f"    Saved: {times_path}")
+
+    fig, axes = plt.subplots(6, 1, figsize=(16, 21), sharex=True)
+    fig.suptitle(T("s6_title"), fontsize=14, fontweight="bold")
+
+    for r in results:
+        c = _color(r.controller_name)
+        t = r.time
+        e = tracking_errors(r)
+        spd = np.sqrt(np.sum(r.nu[:, :3] ** 2, axis=1))
+
+        axes[0].plot(t, r.eta[:, 2], color=c, label=r.controller_name, lw=1.5)
+        plot_heading_continuous(axes[1], t, r.eta[:, 5], label=r.controller_name,
+                                color=c, lw=1.5, anchor_deg=0.0)
+        axes[2].plot(t, e["e_psi_deg"], color=c, label=r.controller_name, lw=1.2)
+        axes[3].plot(t, spd, color=c, label=r.controller_name, lw=1.5)
+        if r.controller_name == "PID (5 Hz)":
+            # PID (5 Hz) alternates between ±15° saturation at every update —
+            # 3 000 square-wave cycles over 600 s cannot be plotted as a readable
+            # line.  Omit from this panel; the instability is discussed in text.
+            pass
+        else:
+            axes[4].plot(t, np.degrees(r.u_actual[:, 0]), color=c, ls="-",
+                         label=f"{r.controller_name} {T('rudder')}", lw=1)
+            axes[4].plot(t, np.degrees(r.u_actual[:, 1]), color=c, ls="--",
+                         label=f"{r.controller_name} {T('stern')}", lw=1, alpha=0.7)
+        axes[5].plot(t, e["cum_abs_z"], color=c,
+                     label=f"{r.controller_name} {T('int_ez')}", lw=1.5)
+
+    ax5b = axes[5].twinx()
+    for r in results:
+        c = _color(r.controller_name)
+        e = tracking_errors(r)
+        ax5b.plot(r.time, e["cum_abs_psi_deg"], color=c, ls="--",
+                  label=f"{r.controller_name} {T('int_epsi')}", lw=1.2, alpha=0.8)
+
+    if r3.eta_d is not None:
+        axes[0].plot(r3.time, r3.eta_d[:, 2], "k--", lw=1, alpha=0.4,
+                     label=T("reference"))
+        plot_heading_continuous(axes[1], r3.time, r3.eta_d[:, 5],
+                                label=T("reference"), color="k", lw=1, ls="--",
+                                alpha=0.4, anchor_deg=0.0)
+
+    for ts in switch_times:
+        for ax in axes:
+            ax.axvline(x=ts, color="gray", ls=":", alpha=0.3)
+
+    axes[0].set_ylabel(T("depth_m"))
+    axes[0].set_title(T("depth_tracking"))
+    axes[0].legend(loc="best", fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].set_ylabel(T("heading_deg"))
+    axes[1].set_title(T("heading_tracking"))
+    axes[1].margins(y=0.08)
+    axes[1].legend(loc="best", fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].axhline(0, color="gray", lw=1, alpha=0.4)
+    axes[2].set_ylabel(T("heading_err_short"))
+    axes[2].set_title(T("heading_error_wrap"))
+    axes[2].legend(loc="best", fontsize=8)
+    axes[2].grid(True, alpha=0.3)
+
+    axes[3].set_ylabel(T("speed_ms"))
+    axes[3].set_title(T("speed"))
+    axes[3].legend(loc="best", fontsize=8)
+    axes[3].grid(True, alpha=0.3)
+
+    axes[4].set_ylabel(T("ctrl_surface_angles"))
+    axes[4].set_title(T("ctrl_surfaces"))
+    axes[4].legend(loc="best", ncol=2, fontsize=7)
+    axes[4].grid(True, alpha=0.3)
+    axes[4].text(
+        0.01, 0.03,
+        T("pid5_omitted"),
+        transform=axes[4].transAxes, fontsize=7.5, color=COLORS["PID (5 Hz)"],
+        va="bottom", style="italic",
+    )
+
+    axes[5].set_ylabel(T("cum_depth_err"))
+    ax5b.set_ylabel(T("cum_hdg_err"))
+    axes[5].set_xlabel(T("time_s"))
+    axes[5].set_title(T("cumulative_errors"))
+    axes[5].grid(True, alpha=0.3)
+
+    lines_a, labels_a = axes[5].get_legend_handles_labels()
+    lines_b, labels_b = ax5b.get_legend_handles_labels()
+    axes[5].legend(lines_a + lines_b, labels_a + labels_b,
+                   loc="best", fontsize=7, ncol=2)
+
+    plt.tight_layout()
+    path = f"{out}/s6_kompleksa_trajektorija.png"
+    plt.savefig(path, dpi=200)
+    print(f"    Saved: {path}")
+    plt.close()
+
+    print(
+        "\n  Interpretation: if heading error is large immediately after switch points, "
+        "this is typically a transient-regime effect.  The heading error is computed as "
+        "the shortest angular difference wrap(heading - reference) in [-180, 180], "
+        "and the figure shows where this error actually accumulates."
+    )
+
+    return results
+
+
+def main():
+    out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "results")
+    os.makedirs(out, exist_ok=True)
+
+    variant = "patched offset-free (N=30)" if USE_PATCHED_NMPC else "original (N=20)"
+    print("\n" + "#" * 70)
+    print("#  REMUS 100 — THREE-WAY COMPARISON")
+    print(f"#  Fossen PID/SMC  vs  tuned PID  vs  NMPC [{variant}]")
+    print("#" * 70)
+
+    scenario_1(out)
+    try:
+        scenario_2(out)
+        scenario_3(out)
+        scenario_4(out)
+        scenario_5(out)
+        scenario_6_complex(out)
+    except Exception as e:
+        print(f"\n  Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("\n" + "=" * 70 + "\n  ALL SCENARIOS COMPLETE\n  Results: " + out +
+          "\n" + "=" * 70)
+
+
+if __name__ == "__main__":
+    main()

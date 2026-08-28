@@ -1,0 +1,10 @@
+# Fossen simulator (install from git clone separately):
+#   git clone https://github.com/cybergalactic/PythonVehicleSimulator.git
+#   pip install -e ./PythonVehicleSimulator
+
+# Core dependencies
+numpy>=1.24
+matplotlib>=3.7
+
+# NMPC optimizer
+casadi>=3.6.3
