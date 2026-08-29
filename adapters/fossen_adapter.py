@@ -224,31 +224,38 @@ class FossenVehicleAdapter:
         )
     
     def run_builtin_autopilot(self, t_final: float, z_d: float, psi_d: float,
-                               n_d: float = 1525, V_c: float = 0.5, 
-                               beta_c: float = 170) -> SimulationResult:
+                               n_d: float = 1525, V_c: float = 0.5,
+                               beta_c: float = 170,
+                               disturbance_fn: Callable = None) -> SimulationResult:
         """
         Run with Fossen's built-in depth+heading autopilot for baseline comparison.
-        
+
         This is useful to verify our controllers against the reference implementation.
+        ``disturbance_fn(t) -> (V_c, beta_c_deg)`` optionally applies the same
+        time-varying current as run(), so the baseline faces identical conditions.
         """
         # Create a fresh vehicle with the autopilot configured
         vehicle = remus100('depthHeadingAutopilot', z_d, psi_d, n_d, V_c, beta_c)
-        
+
         dt = self.sampleTime
         N = int(t_final / dt)
-        
+
         eta = np.zeros(6, float)
         nu = vehicle.nu.copy()
         u_actual = vehicle.u_actual.copy()
-        
+
         time_log = np.zeros(N)
         eta_log = np.zeros((N, 6))
         nu_log = np.zeros((N, 6))
         uc_log = np.zeros((N, 3))
         ua_log = np.zeros((N, 3))
-        
+
         for i in range(N):
             t = i * dt
+            if disturbance_fn is not None:
+                V_now, beta_now_deg = disturbance_fn(t)
+                vehicle.V_c = V_now
+                vehicle.beta_c = beta_now_deg * math.pi / 180
             u_control = vehicle.depthHeadingAutopilot(eta, nu, dt)
             
             time_log[i] = t

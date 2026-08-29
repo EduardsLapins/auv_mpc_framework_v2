@@ -1,4 +1,4 @@
 comparison,n_segments,mean_diff_deg,ci_low_95,ci_high_95,paired_t_p,wilcoxon_p,cohen_dz
-PID (tuned)  vs  PID (5 Hz),9,-0.0069,-0.0109,-0.0029,0.0040,0.0039,-1.328
-PID (tuned)  vs  NMPC offset-free (N=30),9,0.5652,0.2170,0.9135,0.0057,0.0195,1.248
-PID (5 Hz)  vs  NMPC offset-free (N=30),9,0.5722,0.2226,0.9217,0.0054,0.0195,1.258
+PID (tuned)  vs  NMPC traj. (N=12),9,0.2042,0.0202,0.3882,0.0337,0.0547,0.853
+PID (tuned)  vs  NMPC offset-free (N=12),9,0.6980,0.2482,1.1477,0.0072,0.0195,1.193
+NMPC traj. (N=12)  vs  NMPC offset-free (N=12),9,0.4938,0.0347,0.9528,0.0381,0.0273,0.827

@@ -108,16 +108,68 @@ def plot_heading_line(ax, time, angle_rad, *, label, color, lw=1.5, ls="-", alph
                             lw=lw, ls=ls, alpha=alpha)
 
 
+def varying_current(seed: int, t_final: float, V_mean: float, beta_mean_deg: float, *,
+                    dt: float = 0.02, V_sigma: float = 0.12, tau: float = 60.0,
+                    wave_amp: float = 0.08, wave_period: float = 9.0,
+                    beta_sigma_deg: float = 12.0, beta_tau: float = 90.0):
+    """Seeded time-varying ocean current for the standard scenarios.
+
+    Same construction as ``analysis.run_advanced_experiments.gauss_markov_current``
+    (mean-reverting Gauss–Markov speed + wave orbital component + slowly
+    wandering direction), with milder defaults: the scenarios stop being
+    idealised constant-current runs, but the figures stay legible.  The whole
+    realisation is pre-sampled from one seeded RNG, so every rerun produces
+    identical figures.  Returns ``fn(t) -> (V_c, beta_c_deg)`` for
+    ``FossenVehicleAdapter.run(disturbance_fn=...)``; controllers are still
+    told only the nominal mean (V_mean, beta_mean) — the realisation is unknown
+    to them, which keeps the comparison honest.
+    """
+    rng = np.random.default_rng(int(seed))
+    n = int(round(t_final / dt)) + 2
+    t_grid = np.arange(n) * dt
+
+    a_v = math.exp(-dt / tau)
+    q_v = V_sigma * math.sqrt(max(0.0, 1.0 - a_v * a_v))
+    V = np.empty(n)
+    V[0] = V_mean
+    wn = rng.standard_normal(n)
+    for k in range(1, n):
+        V[k] = V_mean + a_v * (V[k - 1] - V_mean) + q_v * wn[k]
+    V = V + wave_amp * np.sin(2.0 * np.pi * t_grid / wave_period
+                              + rng.uniform(0.0, 2.0 * np.pi))
+    V = np.clip(V, 0.0, V_mean + 0.5)
+
+    a_b = math.exp(-dt / beta_tau)
+    q_b = beta_sigma_deg * math.sqrt(max(0.0, 1.0 - a_b * a_b))
+    B = np.empty(n)
+    B[0] = beta_mean_deg
+    bn = rng.standard_normal(n)
+    for k in range(1, n):
+        B[k] = beta_mean_deg + a_b * (B[k - 1] - beta_mean_deg) + q_b * bn[k]
+
+    def fn(t: float):
+        i = min(max(int(t / dt), 0), n - 1)
+        return float(V[i]), float(B[i])
+
+    fn.mean_speed = float(V_mean)
+    fn.t_grid = t_grid
+    fn.V = V
+    fn.beta_deg = B
+    return fn
+
+
 def make_nmpc(V_c: float = 0.0, beta_c: float = 0.0):
     """Build the NMPC controller, using the variant set in config.py."""
     from python_vehicle_simulator.vehicles.remus100 import remus100
     v = remus100("stepInput", V_current=V_c, beta_current=beta_c)
+    # N=12: the horizon sweep (EXP-C) and the S6 horizon check showed accuracy
+    # saturates by N~12, at less than half the compute of N=30.
     if USE_PATCHED_NMPC:
         from controllers.nmpc_remus_patched import NMPC_REMUS100_Patched
-        nmpc = NMPC_REMUS100_Patched(v, N=30, n_rpm=1525)
+        nmpc = NMPC_REMUS100_Patched(v, N=12, n_rpm=1525)
     else:
         from controllers.nmpc_remus import NMPC_REMUS100
-        nmpc = NMPC_REMUS100(v, N=20, n_rpm=1525)
+        nmpc = NMPC_REMUS100(v, N=12, n_rpm=1525)
     nmpc.set_current_estimate(V_c, beta_c * D2R)
     return nmpc
 
@@ -419,32 +471,38 @@ def plot_scenario(results, path: str, title: str, tz: float | None = None,
     axes[2].legend()
     axes[2].grid(True, alpha=0.3)
 
-    plt.tight_layout()
+    # leave headroom so the suptitle does not overlap the first panel title
+    plt.tight_layout(rect=(0, 0, 1, 0.955))
     plt.savefig(path, dpi=200)
     print(f"    Saved: {path}")
     plt.close()
 
 
-def run_three(t_final, z_d, psi_d, Vc, bc, ref, tag, out, title):
+def run_three(t_final, z_d, psi_d, Vc, bc, ref, tag, out, title, *, seed=0):
+    # Every scenario runs against a seeded time-varying current realisation
+    # (identical for all three controllers); controllers only know the mean.
+    dist = varying_current(seed, t_final, Vc, bc)
     results = []
 
     print("    Fossen autopilot...")
     a = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
-    r1 = a.run_builtin_autopilot(t_final, z_d, psi_d, 1525, Vc, bc)
+    r1 = a.run_builtin_autopilot(t_final, z_d, psi_d, 1525, Vc, bc,
+                                 disturbance_fn=dist)
     r1.controller_name = "Fossen PID/SMC"
     results.append(r1)
 
     print("    Tuned PID (50 Hz)...")
     pid = make_pid()
     a2 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
-    r2 = a2.run(t_final, wrap_pid(pid), ref, sampleTime=0.02)
+    r2 = a2.run(t_final, wrap_pid(pid), ref, sampleTime=0.02, disturbance_fn=dist)
     r2.controller_name = "PID (tuned)"
     results.append(r2)
 
     print("    NMPC...")
     nmpc = make_nmpc(Vc, bc)
     a3 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
-    r3 = a3.run(t_final, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02)
+    r3 = a3.run(t_final, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02,
+                disturbance_fn=dist)
     r3.controller_name = nmpc.name
     results.append(r3)
 
@@ -464,12 +522,13 @@ def scenario_1(out):
         smooth_ref([(0, 0), (30, 50)], [2.0]),
         "s1_standarts", out,
         T("s1_title"),
+        seed=1,
     )
 
 
 def scenario_2(out):
     print("\n" + "=" * 70 + "\n  SCENARIO 2: Disturbed environment\n" + "=" * 70)
-    for Vc, bc in [(0.0, 0), (0.5, 170), (1.0, 170)]:
+    for i, (Vc, bc) in enumerate([(0.0, 0), (0.5, 170), (1.0, 170)]):
         print(f"\n  Current: {Vc} m/s @ {bc} deg")
         tag = f"s2_Vc{Vc:.1f}".replace(".", "_")
         run_three(
@@ -477,18 +536,20 @@ def scenario_2(out):
             smooth_ref([(0, 0), (30, 50)], [2.0]),
             tag, out,
             T("s2_title").format(vc=Vc),
+            seed=21 + i,
         )
 
 
 def scenario_3(out):
     print("\n" + "=" * 70 + "\n  SCENARIO 3: Large heading changes\n" + "=" * 70)
-    for pd in [90, 180]:
+    for j, pd in enumerate([90, 180]):
         print(f"\n  Heading: 0 -> {pd} deg")
         run_three(
             200, 20, pd, 0.3, 90,
             smooth_ref([(0, 0), (20, pd)], [2.0], tau_rise=15.0),
             f"s3_kurss{pd}", out,
             T("s3_title").format(pd=pd),
+            seed=31 + j,
         )
 
 
@@ -496,9 +557,10 @@ def scenario_4(out):
     print("\n" + "=" * 70 + "\n  SCENARIO 4: Multi-waypoint mission\n" + "=" * 70)
     ref = smooth_ref([(0, 0), (20, 30), (40, 120), (20, 30)], [5.0, 100.0, 200.0],
                      tau_rise=15.0)
+    dist = varying_current(4, 400, 0.5, 170)
     nmpc = make_nmpc(0.5, 170)
     a = FossenVehicleAdapter(V_current=0.5, beta_current=170)
-    r = a.run(400, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02)
+    r = a.run(400, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02, disturbance_fn=dist)
     r.controller_name = nmpc.name
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
@@ -524,7 +586,7 @@ def scenario_4(out):
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=(0, 0, 1, 0.94))
     path = f"{out}/s4_daudzpunkti.png"
     plt.savefig(path, dpi=200)
     print(f"    Saved: {path}")
@@ -538,6 +600,7 @@ def scenario_5(out):
         smooth_ref([(0, 0), (50, 0)], [2.0], tau_rise=5.0),
         "s5_descent", out,
         T("s5_title"),
+        seed=5,
     )
 
 
@@ -630,13 +693,17 @@ def scenario_6_complex(out):
     # far above the NMPC predictor's pitch constraint (25°), causing a large
     # pitch→yaw coupling mismatch that neither the model nor the observer can cancel.
     ref = smooth_ref(waypoints, switch_times, tau_rise=12.0, z_rate_max=1.0)
+    # Same seeded time-varying current for all three controllers (seed 6);
+    # analysis.compare_nmpc_patch rebuilds the identical realisation.
+    dist = varying_current(6, t_final, Vc, bc)
     results = []
 
     # PID at 50 Hz — standard embedded-system rate
     print("    PID (50 Hz)...")
     pid_50 = make_pid()
     a_pid50 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
-    r_pid50 = a_pid50.run(t_final, wrap_pid(pid_50), ref, sampleTime=0.02)
+    r_pid50 = a_pid50.run(t_final, wrap_pid(pid_50), ref, sampleTime=0.02,
+                          disturbance_fn=dist)
     r_pid50.controller_name = "PID (tuned)"
     results.append(r_pid50)
 
@@ -644,7 +711,8 @@ def scenario_6_complex(out):
     print("    PID (5 Hz) — rate-matched to NMPC...")
     pid_5 = make_pid()
     a_pid5 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
-    r_pid5 = a_pid5.run(t_final, wrap_pid_5hz(pid_5), ref, sampleTime=0.02)
+    r_pid5 = a_pid5.run(t_final, wrap_pid_5hz(pid_5), ref, sampleTime=0.02,
+                        disturbance_fn=dist)
     r_pid5.controller_name = "PID (5 Hz)"
     results.append(r_pid5)
 
@@ -652,7 +720,8 @@ def scenario_6_complex(out):
     print("    NMPC (5 Hz)...")
     nmpc = make_nmpc(Vc, bc)
     a3 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
-    r3 = a3.run(t_final, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02)
+    r3 = a3.run(t_final, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02,
+                disturbance_fn=dist)
     r3.controller_name = nmpc.name
     results.append(r3)
 
@@ -771,12 +840,6 @@ def scenario_6_complex(out):
     axes[4].set_title(T("ctrl_surfaces"))
     axes[4].legend(loc="best", ncol=2, fontsize=7)
     axes[4].grid(True, alpha=0.3)
-    axes[4].text(
-        0.01, 0.03,
-        T("pid5_omitted"),
-        transform=axes[4].transAxes, fontsize=7.5, color=COLORS["PID (5 Hz)"],
-        va="bottom", style="italic",
-    )
 
     axes[5].set_ylabel(T("cum_depth_err"))
     ax5b.set_ylabel(T("cum_hdg_err"))
@@ -789,10 +852,47 @@ def scenario_6_complex(out):
     axes[5].legend(lines_a + lines_b, labels_a + labels_b,
                    loc="best", fontsize=7, ncol=2)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=(0, 0, 1, 0.975))
     path = f"{out}/s6_kompleksa_trajektorija.png"
     plt.savefig(path, dpi=200)
     print(f"    Saved: {path}")
+    plt.close()
+
+    # ---- horizontal trajectory (top view, illustrative only) ------------
+    # The mission defines depth/heading/speed references, NOT an x/y route,
+    # so no desired x/y trajectory exists and none is constructed here.
+    # x/y is not fed back to either controller; the current drift is
+    # identical for both, so path differences reflect heading/speed
+    # tracking differences.  Evaluation metrics remain depth/heading.
+    r_nmpc = results[-1]
+    t_grid = np.asarray(r_nmpc.time, float)
+    dt_s = float(t_grid[1] - t_grid[0]) if len(t_grid) > 1 else 0.02
+
+    fig, ax = plt.subplots(figsize=(9, 8.5))
+    for r in results:
+        if r.controller_name == "PID (5 Hz)":
+            continue  # visually indistinguishable from PID (tuned) at this scale
+        c = _color(r.controller_name)
+        ax.plot(r.eta[:, 1], r.eta[:, 0], color=c, lw=1.6, label=r.controller_name)
+        ax.scatter([r.eta[-1, 1]], [r.eta[-1, 0]], color=c, s=42, zorder=5,
+                   edgecolor="white")
+    first_switch = True
+    for ts in switch_times:
+        i = min(int(ts / dt_s), len(t_grid) - 1)
+        ax.scatter([r_nmpc.eta[i, 1]], [r_nmpc.eta[i, 0]], color="k", s=14,
+                   zorder=6, label=T("seg_switches") if first_switch else None)
+        first_switch = False
+    ax.scatter([0], [0], marker="s", color="k", s=55, zorder=6, label=T("start"))
+    ax.set_xlabel(T("east_m"))
+    ax.set_ylabel(T("north_m"))
+    ax.set_title(T("s6_xy_title"), fontsize=13, fontweight="bold")
+    ax.axis("equal")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right", fontsize=8.5)
+    plt.tight_layout()
+    path_xy = f"{out}/s6_trajektorija_xy.png"
+    plt.savefig(path_xy, dpi=200)
+    print(f"    Saved: {path_xy}")
     plt.close()
 
     print(
@@ -810,7 +910,7 @@ def main():
                        "results")
     os.makedirs(out, exist_ok=True)
 
-    variant = "patched offset-free (N=30)" if USE_PATCHED_NMPC else "original (N=20)"
+    variant = "patched offset-free (N=12)" if USE_PATCHED_NMPC else "original (N=12)"
     print("\n" + "#" * 70)
     print("#  REMUS 100 — THREE-WAY COMPARISON")
     print(f"#  Fossen PID/SMC  vs  tuned PID  vs  NMPC [{variant}]")

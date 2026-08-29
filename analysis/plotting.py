@@ -44,7 +44,9 @@ PALETTE = {
     "Fossen PID/SMC":   "#d1495b",   # muted red
     "PID (tuned)":      "#2e86ab",   # muted blue  (50 Hz)
     "PID (5 Hz)":       "#e67e22",   # orange — rate-matched to NMPC
-    "NMPC":             "#1b998b",   # teal-green
+    "NMPC":             "#1b998b",   # teal-green — the main (offset-free) NMPC
+    "NMPC original":    "#7d5ba6",   # purple — original N=20 variant, so the
+                                     # two NMPC curves are distinguishable
     "reference":        "#5a5a66",   # neutral grey
 }
 _DEFAULT = "#1b998b"
@@ -55,6 +57,8 @@ def controller_color(name: str) -> str:
     if name in PALETTE:
         return PALETTE[name]
     if name.upper().startswith("NMPC"):
+        if "traj" in name:
+            return PALETTE["NMPC original"]
         return PALETTE["NMPC"]
     if "5 Hz" in name and name.startswith("PID"):
         return PALETTE["PID (5 Hz)"]

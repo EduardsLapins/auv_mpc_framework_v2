@@ -97,7 +97,10 @@ def _build_augmented_dynamics(vehicle, *, k_couple: float = 0.0):
     M_s_coeff = -(-x_s) * 0.5 * rho * A_s * CL_s
     N_r_coeff = x_r * (-0.5 * rho * A_r * CL_r)
 
+    # Propeller: same Wageningen linearisation as the Fossen truth model
+    # (advance-ratio thrust loss included — see adapters/casadi_model.py).
     D_prop = 0.14;  KT_0 = 0.4566;  t_prop = 0.1
+    KT_max = 0.1798;  Ja_max = 0.6632;  w_wake = 0.944   # Va = 0.944 * U
     S = vehicle.S;  CD_0 = vehicle.CD_0
 
     x = ca.SX.sym('x', 6)
@@ -119,8 +122,12 @@ def _build_augmented_dynamics(vehicle, *, k_couple: float = 0.0):
     theta_dot = q
     psi_dot = r
 
-    X_prop = (1 - t_prop) * rho * D_prop**4 * KT_0 * ca.fabs(n_rps) * n_rps
-    X_drag = d_surge * u_r + 0.5 * rho * S * CD_0 * u_r * ca.fabs(u_r)
+    Va = w_wake * ca.fabs(u_s)
+    X_prop = (1 - t_prop) * rho * D_prop**4 * (
+        KT_0 * ca.fabs(n_rps) * n_rps
+        + (KT_max - KT_0) / Ja_max * (Va / D_prop) * ca.fabs(n_rps))
+    X_drag = d_surge * ca.exp(-3.0 * U_r) * u_r \
+        + 0.5 * rho * S * CD_0 * u_r * ca.fabs(u_r)
     u_dot = (X_prop - X_drag) / m11
 
     M_stern = M_s_coeff * U_r**2 * delta_s
@@ -202,6 +209,13 @@ class NMPC_REMUS100_Patched:
         opti = ca.Opti()
         X = opti.variable(self.n_x, self.N + 1)
         U = opti.variable(self.n_u, self.N)
+        # Soft theta/q/r limits via exact-penalty slacks — see nmpc_remus.py:
+        # with X[:,0] pinned to the measurement, hard state bounds make the NLP
+        # infeasible whenever the real vehicle exceeds a limit, and the
+        # resulting solve-failure cascade is unrecoverable.
+        S_state = opti.variable(3)           # [s_theta, s_q, s_r] >= 0
+        w_slack_lin = 1.0e3
+        w_slack_quad = 1.0e4
 
         x0_p = opti.parameter(self.n_x)
         X_ref_p = opti.parameter(self.n_x, self.N + 1)
@@ -245,6 +259,7 @@ class NMPC_REMUS100_Patched:
 
         x_err_N = wrapped_state_error(X[:, self.N], X_ref_p[:, self.N])
         J += x_err_N.T @ P @ x_err_N
+        J += w_slack_lin * ca.sum1(S_state) + w_slack_quad * ca.sumsqr(S_state)
         opti.minimize(J)
 
         opti.subject_to(X[:, 0] == x0_p)
@@ -258,10 +273,14 @@ class NMPC_REMUS100_Patched:
             opti.subject_to(opti.bounded(-self.du_max[1], U[1, k] - prev_u[1], self.du_max[1]))
             opti.subject_to(opti.bounded(-self.du_max[2], U[2, k] - prev_u[2], self.du_max[2]))
 
+        opti.subject_to(S_state >= 0)
         for k in range(self.N + 1):
-            opti.subject_to(opti.bounded(-self.theta_max, X[1, k], self.theta_max))
-            opti.subject_to(opti.bounded(-self.q_max, X[4, k], self.q_max))
-            opti.subject_to(opti.bounded(-self.r_max, X[5, k], self.r_max))
+            opti.subject_to(opti.bounded(-self.theta_max - S_state[0], X[1, k],
+                                         self.theta_max + S_state[0]))
+            opti.subject_to(opti.bounded(-self.q_max - S_state[1], X[4, k],
+                                         self.q_max + S_state[1]))
+            opti.subject_to(opti.bounded(-self.r_max - S_state[2], X[5, k],
+                                         self.r_max + S_state[2]))
 
         opts = {
             "ipopt.print_level": 0,

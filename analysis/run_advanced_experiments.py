@@ -254,10 +254,9 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
     t_final, z_d, psi_d, switch_times, only_changing, ref = _robustness_mission(fw)
     print(f"[EXP-A] Monte-Carlo robustness: {n_seeds} seeds, mission {t_final:.0f}s")
 
-    acc = {
-        "PID (pielāgots)": {"z_rmse": [], "psi_rmse": [], "psi_settled": [], "psi_max": []},
-        "NMPC traj. (N=20)": {"z_rmse": [], "psi_rmse": [], "psi_settled": [], "psi_max": []},
-    }
+    # Keyed by the controller names the runs actually report (PID first,
+    # NMPC second — insertion order is relied on below for the paired stats).
+    acc: dict = {}
 
     for s in range(n_seeds):
         dist = gauss_markov_current(s, t_final)
@@ -284,7 +283,8 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
             split = metrics.split_transient_steady(
                 t, psi, psi_ref, switch_times, angular=True,
                 only_changing=only_changing, transient_window=35.0)
-            d = acc[r.controller_name]
+            d = acc.setdefault(r.controller_name, {
+                "z_rmse": [], "psi_rmse": [], "psi_settled": [], "psi_max": []})
             d["z_rmse"].append(zm.rmse)
             d["psi_rmse"].append(pm.rmse * R2D)
             d["psi_max"].append(pm.max_abs * R2D)
@@ -293,11 +293,12 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
 
     # ---- summarise + paired stats -------------------------------------------
     names = list(acc)
+    pid_name, nmpc_name = names
     rows = []
     for metric_key, label, unit in [
         ("z_rmse", "Dziļuma RMSE", "m"),
         ("psi_rmse", "Kursa RMSE", "°"),
-        ("psi_settled", "Nostabilizēts kursa RMSE", "°"),
+        ("psi_settled", "Miera stāvokļa kursa RMSE", "°"),
         ("psi_max", "Kursa max|e|", "°"),
     ]:
         for nm in names:
@@ -314,12 +315,12 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
             })
 
     cmp_psi = metrics.paired_comparison(
-        acc["PID (pielāgots)"]["psi_rmse"],
-        acc["NMPC traj. (N=20)"]["psi_rmse"],
+        acc[pid_name]["psi_rmse"],
+        acc[nmpc_name]["psi_rmse"],
         labels=("PID", "NMPC"))
     cmp_settled = metrics.paired_comparison(
-        acc["PID (pielāgots)"]["psi_settled"],
-        acc["NMPC traj. (N=20)"]["psi_settled"],
+        acc[pid_name]["psi_settled"],
+        acc[nmpc_name]["psi_settled"],
         labels=("PID", "NMPC"))
 
     # ---- figures ------------------------------------------------------------
@@ -327,17 +328,17 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
         {nm: acc[nm]["psi_rmse"] for nm in names},
         os.path.join(out_dir, "mc_heading_rmse_box.png"),
         ylabel="Kursa RMSE [°]",
-        title=f"Kursa RMSE sadalījums pa {n_seeds} straumes realizācijām")
+        title=f"Kursa RMSE sadalījums {n_seeds} testos ar nejaušiem trokšņiem")
     f_settled = plotting.plot_metric_boxes(
         {nm: acc[nm]["psi_settled"] for nm in names},
         os.path.join(out_dir, "mc_heading_settled_box.png"),
-        ylabel="Nostabilizēts kursa RMSE [°]",
-        title="Nostabilizētas turēšanas precizitāte pa realizācijām")
+        ylabel="Miera stāvokļa kursa RMSE [°]",
+        title=f"Miera stāvokļa precizitāte {n_seeds} testos ar nejaušiem trokšņiem")
     f_depth = plotting.plot_metric_boxes(
         {nm: acc[nm]["z_rmse"] for nm in names},
         os.path.join(out_dir, "mc_depth_rmse_box.png"),
         ylabel="Dziļuma RMSE [m]",
-        title="Dziļuma RMSE sadalījums pa realizācijām")
+        title=f"Dziļuma RMSE sadalījums {n_seeds} testos ar nejaušiem trokšņiem")
 
     # ---- tables -------------------------------------------------------------
     csv_path = report.write_csv(
@@ -353,12 +354,12 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
                 f"Wilcoxon p = {c['wilcoxon_p']:.2e} (n={c['n']})")
 
     body = (
-        f"Pārbaudītas {n_seeds} neatkarīgas, ar sēklu noteiktas straumes "
-        f"realizācijas (Gausa–Markova ātrums + viļņu komponente + Gausa–Markova "
-        f"virziens). Katra realizācija tiek piemērota abiem kontrolieriem "
-        f"identiski, tāpēc salīdzinājums ir pārī (paired).\n\n"
+        f"Veikti {n_seeds} testi ar neatkarīgiem, ar sēklu noteiktiem nejaušiem "
+        f"straumes trokšņiem (Gausa–Markova ātrums + viļņu komponente + "
+        f"Gausa–Markova virziens). Katrā testā abi kontrolieri saņem identisku "
+        f"trokšņa realizāciju, tāpēc salīdzinājums ir pārī (paired).\n\n"
         f"- Kopējais kursa RMSE: {_fmt_cmp(cmp_psi)}.\n"
-        f"- Nostabilizēts kursa RMSE: {_fmt_cmp(cmp_settled)}.\n\n"
+        f"- Miera stāvokļa kursa RMSE: {_fmt_cmp(cmp_settled)}.\n\n"
         f"Pozitīva vidējā starpība nozīmē, ka PID kļūda ir lielāka (NMPC labāks); "
         f"negatīva — pretēji. |Cohen dz| ≳ 0,8 norāda lielu efektu.\n"
     )
@@ -423,14 +424,14 @@ def run_compute_cost(out_dir: str, *, quick: bool = False) -> dict:
         "P95": timing["p95_ms"],
         "P99": timing["p99_ms"],
         "Maks.": timing["max_ms"],
-        "Termiņš": timing["deadline_ms"],
-        "Daļa_termiņā": timing["frac_realtime"],
+        "Periods": timing["deadline_ms"],
+        "Daļa_periodā": timing["frac_realtime"],
         "Maks_pārsniegums": timing["worst_overrun_ms"],
     }]
     csv_path = report.write_csv(
         rows,
         ["Mērvienība", "Vidējais", "Mediāna", "P95", "P99", "Maks.",
-         "Termiņš", "Daļa_termiņā", "Maks_pārsniegums"],
+         "Periods", "Daļa_periodā", "Maks_pārsniegums"],
         os.path.join(out_dir, "nmpc_solver_timing.csv"))
 
     print(f"[EXP-B] mean {timing['mean_ms']:.1f} ms, P99 {timing['p99_ms']:.1f} ms, "
@@ -446,7 +447,7 @@ def run_compute_cost(out_dir: str, *, quick: bool = False) -> dict:
 def run_horizon_sweep(out_dir: str, *, horizons=None, quick: bool = False) -> dict:
     """Sweep the NMPC prediction horizon N and chart accuracy vs compute.
 
-    Justifies the choice of N=20: too short loses preview (worse tracking), too
+    Justifies the choice of N=12: too short loses preview (worse tracking), too
     long costs compute with diminishing returns.  Plots heading RMSE against the
     P99 solve time so the knee of the trade-off is visible.
     """
@@ -492,7 +493,7 @@ def run_horizon_sweep(out_dir: str, *, horizons=None, quick: bool = False) -> di
             "Kursa_RMSE_deg": rmse_deg,
             "P99_ms": p99,
             "Maks_ms": timing.get("max_ms", float("nan")),
-            "Daļa_termiņā": timing.get("frac_realtime", float("nan")),
+            "Daļa_periodā": timing.get("frac_realtime", float("nan")),
         })
         print(f"  N={N:2d}: heading RMSE {rmse_deg:6.2f}°, P99 {p99:6.1f} ms, "
               f"{100*timing.get('frac_realtime', float('nan')):.0f}% real time")
@@ -500,9 +501,9 @@ def run_horizon_sweep(out_dir: str, *, horizons=None, quick: bool = False) -> di
     fig = plotting.plot_pareto(
         points, os.path.join(out_dir, "horizon_pareto.png"),
         xlabel="P99 risinātāja laiks [ms]", ylabel="Kursa RMSE [°]",
-        title="Horizonta N kompromiss: precizitāte pret skaitļošanas izmaksu")
+        title="Horizonta N kompromiss: precizitāte pret skaitļošanas izmaksām")
     csv_path = report.write_csv(
-        rows, ["N", "Kursa_RMSE_deg", "P99_ms", "Maks_ms", "Daļa_termiņā"],
+        rows, ["N", "Kursa_RMSE_deg", "P99_ms", "Maks_ms", "Daļa_periodā"],
         os.path.join(out_dir, "horizon_sweep.csv"))
 
     print(f"[EXP-C] wrote {fig}, {csv_path}")

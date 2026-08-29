@@ -38,7 +38,12 @@ def build_casadi_dynamics(vehicle):
     M_s_coeff = -(-x_s) * 0.5 * rho * A_s * CL_s
     N_r_coeff = x_r * (-0.5 * rho * A_r * CL_r)
 
+    # Propeller: same Wageningen linearisation as the Fossen truth model.
+    # KT falls with advance number Ja = Va/(n*D); omitting this term makes the
+    # predictor believe it has ~2.5x the real thrust at cruise speed, so the
+    # NMPC under-commands RPM and the vehicle runs visibly slower than 2.5 m/s.
     D_prop = 0.14;  KT_0 = 0.4566;  t_prop = 0.1
+    KT_max = 0.1798;  Ja_max = 0.6632;  w_wake = 0.944   # Va = 0.944 * U
     S = vehicle.S;  CD_0 = vehicle.CD_0
 
     # CasADi symbols
@@ -68,8 +73,16 @@ def build_casadi_dynamics(vehicle):
     psi_dot = r
 
     # ─── SURGE ───────────────────────────────────────────────────
-    X_prop = (1 - t_prop) * rho * D_prop**4 * KT_0 * ca.fabs(n_rps) * n_rps
-    X_drag = d_surge * u_r + 0.5 * rho * S * CD_0 * u_r * ca.fabs(u_r)
+    # Thrust with the advance-ratio loss (matches remus100.dynamics for n >= 0):
+    #   X_prop = rho D^4 [ KT_0 |n|n + (KT_max-KT_0)/Ja_max * (Va/D) |n| ]
+    Va = w_wake * ca.fabs(u_s)
+    X_prop = (1 - t_prop) * rho * D_prop**4 * (
+        KT_0 * ca.fabs(n_rps) * n_rps
+        + (KT_max - KT_0) / Ja_max * (Va / D_prop) * ca.fabs(n_rps))
+    # Linear damping vanishes at speed (exp(-3 U_r), as in the truth model);
+    # quadratic hull drag dominates at cruise.
+    X_drag = d_surge * ca.exp(-3.0 * U_r) * u_r \
+        + 0.5 * rho * S * CD_0 * u_r * ca.fabs(u_r)
     u_dot = (X_prop - X_drag) / m11
 
     # ─── PITCH ───────────────────────────────────────────────────

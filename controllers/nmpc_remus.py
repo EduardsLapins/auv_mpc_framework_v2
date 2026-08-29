@@ -93,6 +93,16 @@ class NMPC_REMUS100:
         opti = ca.Opti()
         X = opti.variable(self.n_x, self.N + 1)
         U = opti.variable(self.n_u, self.N)
+        # Slack variables that soften the theta/q/r state limits.  The initial
+        # state is pinned to the measurement, so hard state bounds make the NLP
+        # structurally infeasible whenever the real vehicle exceeds a limit
+        # (e.g. pitch overshoot in a steep climb) — every solve then fails and
+        # the stale-command fallback lets the vehicle diverge.  An exact
+        # (L1 + L2) penalty keeps the slacks at zero except when a violation
+        # is unavoidable, so the optimiser can always plan a recovery.
+        S_state = opti.variable(3)           # [s_theta, s_q, s_r] >= 0
+        w_slack_lin = 1.0e3
+        w_slack_quad = 1.0e4
 
         x0_p = opti.parameter(self.n_x)
         X_ref_p = opti.parameter(self.n_x, self.N + 1)
@@ -129,6 +139,7 @@ class NMPC_REMUS100:
 
         x_err_N = wrapped_state_error(X[:, self.N], X_ref_p[:, self.N])
         J += x_err_N.T @ P @ x_err_N
+        J += w_slack_lin * ca.sum1(S_state) + w_slack_quad * ca.sumsqr(S_state)
         opti.minimize(J)
 
         opti.subject_to(X[:, 0] == x0_p)
@@ -148,10 +159,14 @@ class NMPC_REMUS100:
             opti.subject_to(opti.bounded(-self.du_max[1], U[1, k] - prev_u[1], self.du_max[1]))
             opti.subject_to(opti.bounded(-self.du_max[2], U[2, k] - prev_u[2], self.du_max[2]))
 
+        opti.subject_to(S_state >= 0)
         for k in range(self.N + 1):
-            opti.subject_to(opti.bounded(-self.theta_max, X[1, k], self.theta_max))
-            opti.subject_to(opti.bounded(-self.q_max, X[4, k], self.q_max))
-            opti.subject_to(opti.bounded(-self.r_max, X[5, k], self.r_max))
+            opti.subject_to(opti.bounded(-self.theta_max - S_state[0], X[1, k],
+                                         self.theta_max + S_state[0]))
+            opti.subject_to(opti.bounded(-self.q_max - S_state[1], X[4, k],
+                                         self.q_max + S_state[1]))
+            opti.subject_to(opti.bounded(-self.r_max - S_state[2], X[5, k],
+                                         self.r_max + S_state[2]))
 
         opts = {
             "ipopt.print_level": 0,

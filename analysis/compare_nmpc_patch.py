@@ -7,8 +7,8 @@ as ``experiments.run_remus100_comparison.scenario_6_complex``) with three
 controllers:
 
     * PID (tuned)                 — the tuned baseline, for reference
-    * NMPC traj. (N=20)           — the ORIGINAL controller (controllers.nmpc_remus)
-    * NMPC offset-free (N=30)     — the PATCHED controller (controllers.nmpc_remus_patched)
+    * NMPC traj. (N=12)           — the ORIGINAL controller (controllers.nmpc_remus)
+    * NMPC offset-free (N=12)     — the PATCHED controller (controllers.nmpc_remus_patched)
 
 and quantifies whether the patch shrinks the two transient failures:
 
@@ -52,14 +52,15 @@ SWITCH = [5, 60, 120, 180, 260, 340, 420, 500]
 T_FINAL_FULL = 600.0
 V_C, BETA_C = 0.6, 150.0
 
-WIN_DEPTH    = (260.0, 340.0)
-WIN_REVERSAL = (500.0, 600.0)
+WIN_DEPTH    = (255.0, 310.0)   # ascent transition + short settled tail
+WIN_REVERSAL = (495.0, 560.0)   # reversal turn + short settled tail
 
-# Stable internal names for colour lookup (distinct colours for before/after)
+# Stable internal names for colour lookup (matches analysis.plotting.PALETTE
+# so the two NMPC variants keep the same colours in every figure)
 COL = {
     "PID (tuned)":             "#2e86ab",
-    "NMPC traj. (N=20)":       "#1b998b",
-    "NMPC offset-free (N=30)": "#e8893a",
+    "NMPC traj. (N=12)":       "#7d5ba6",
+    "NMPC offset-free (N=12)": "#1b998b",
     "reference":               "#5a5a66",
 }
 
@@ -96,7 +97,7 @@ def _run(t_final: float):
     try:
         from adapters.fossen_adapter import FossenVehicleAdapter
         from experiments.run_remus100_comparison import (
-            make_pid, wrap_pid, wrap_nmpc, smooth_ref,
+            make_pid, wrap_pid, wrap_nmpc, smooth_ref, varying_current,
             heading_continuous_deg, heading_error_deg,
         )
         from controllers.nmpc_remus import NMPC_REMUS100
@@ -105,27 +106,32 @@ def _run(t_final: float):
     except Exception as exc:
         raise SystemExit(f"[compare_nmpc_patch] framework import failed: {exc}")
 
-    ref = smooth_ref(WAYPOINTS, SWITCH, tau_rise=12.0)
+    # z_rate_max=1.0 and current seed 6 mirror scenario_6_complex exactly, so
+    # this A/B faces the identical mission and current realisation.
+    ref = smooth_ref(WAYPOINTS, SWITCH, tau_rise=12.0, z_rate_max=1.0)
+    dist = varying_current(6, t_final, V_C, BETA_C)
     runs = {}
 
     print("  PID (tuned) ...")
     pid = make_pid()
     a = FossenVehicleAdapter(V_current=V_C, beta_current=BETA_C)
-    r_pid = a.run(t_final, wrap_pid(pid), ref, sampleTime=0.02)
+    r_pid = a.run(t_final, wrap_pid(pid), ref, sampleTime=0.02, disturbance_fn=dist)
 
-    print("  NMPC traj. (N=20)  [original] ...")
+    print("  NMPC traj. (N=12)  [original] ...")
     veh0 = remus100("stepInput", V_current=V_C, beta_current=BETA_C)
-    nmpc0 = NMPC_REMUS100(veh0, N=20, n_rpm=1525)
+    nmpc0 = NMPC_REMUS100(veh0, N=12, n_rpm=1525)
     nmpc0.set_current_estimate(V_C, BETA_C * D2R)
     a0 = FossenVehicleAdapter(V_current=V_C, beta_current=BETA_C)
-    r0 = a0.run(t_final, wrap_nmpc(nmpc0, ref), ref, sampleTime=0.02)
+    r0 = a0.run(t_final, wrap_nmpc(nmpc0, ref), ref, sampleTime=0.02,
+                disturbance_fn=dist)
 
-    print("  NMPC offset-free (N=30)  [patched] ...")
+    print("  NMPC offset-free (N=12)  [patched] ...")
     veh1 = remus100("stepInput", V_current=V_C, beta_current=BETA_C)
-    nmpc1 = NMPC_REMUS100_Patched(veh1, N=30, n_rpm=1525)
+    nmpc1 = NMPC_REMUS100_Patched(veh1, N=12, n_rpm=1525)
     nmpc1.set_current_estimate(V_C, BETA_C * D2R)
     a1 = FossenVehicleAdapter(V_current=V_C, beta_current=BETA_C)
-    r1 = a1.run(t_final, wrap_nmpc(nmpc1, ref), ref, sampleTime=0.02)
+    r1 = a1.run(t_final, wrap_nmpc(nmpc1, ref), ref, sampleTime=0.02,
+                disturbance_fn=dist)
 
     t = np.asarray(r_pid.time, float)
     ref_cont = heading_continuous_deg(r_pid.eta_d[:, 5], anchor_deg=0.0)
@@ -133,8 +139,8 @@ def _run(t_final: float):
     solve = {}
     for name, res, ctrl in [
         ("PID (tuned)",             r_pid, pid),
-        ("NMPC traj. (N=20)",       r0,   nmpc0),
-        ("NMPC offset-free (N=30)", r1,   nmpc1),
+        ("NMPC traj. (N=12)",       r0,   nmpc0),
+        ("NMPC offset-free (N=12)", r1,   nmpc1),
     ]:
         runs[name] = {
             "t": t,
@@ -207,7 +213,7 @@ def _zoom_overlay(t, ref_cont_deg, runs, window, path, *, title):
                                      gridspec_kw={"height_ratios": [2, 1]})
     ax_h.plot(t[mask], ref_cont_deg[mask], color=COL["reference"], lw=1.6,
               ls="--", label=T("reference"))
-    for name in ("NMPC traj. (N=20)", "NMPC offset-free (N=30)"):
+    for name in ("PID (tuned)", "NMPC traj. (N=12)", "NMPC offset-free (N=12)"):
         if name not in runs:
             continue
         ax_h.plot(t[mask], runs[name]["heading_cont_deg"][mask],
@@ -216,7 +222,7 @@ def _zoom_overlay(t, ref_cont_deg, runs, window, path, *, title):
     ax_h.set_title(title, fontsize=12, fontweight="bold")
     ax_h.legend(loc="best")
 
-    for name in ("NMPC traj. (N=20)", "NMPC offset-free (N=30)"):
+    for name in ("PID (tuned)", "NMPC traj. (N=12)", "NMPC offset-free (N=12)"):
         if name not in runs:
             continue
         e = np.abs(runs[name]["err_deg"][mask])
@@ -260,7 +266,7 @@ def main(argv=None):
     # ---- 3-way regime + segment figures ----
     f_regime = P.plot_regime_comparison(
         regimes, os.path.join(args.out, "patch_regime_comparison.png"),
-        title="Heading RMSE by regime: original vs. patched NMPC")
+        title=T("patch_regime_title"))
     f_seg = P.plot_segment_breakdown(
         seg, os.path.join(args.out, "patch_segment_breakdown.png"),
         turn_labels=_turn_labels(bounds), metric="iae", unit="°·s")
@@ -269,13 +275,13 @@ def main(argv=None):
     f_depth = _zoom_overlay(
         t, ref_cont, runs, WIN_DEPTH,
         os.path.join(args.out, "patch_zoom_depthcoupling.png"),
-        title="Depth-induced heading excursion (260–340 s): original vs. patched")
+        title=T("patch_zoom_depth_title"))
     figs.append(f_depth)
     if not args.quick:
         f_rev = _zoom_overlay(
             t, ref_cont, runs, WIN_REVERSAL,
             os.path.join(args.out, "patch_zoom_reversal.png"),
-            title="Sharp reversal overshoot (500–600 s): original vs. patched")
+            title=T("patch_zoom_rev_title"))
         figs.append(f_rev)
 
     # ---- save time-series CSV for thesis_analysis.py ----
@@ -293,8 +299,8 @@ def main(argv=None):
                        + [f"{runs[n]['err_deg'][i]:.6f}" for n in names])
 
     # ---- summary table ----
-    o = "NMPC traj. (N=20)"
-    q = "NMPC offset-free (N=30)"
+    o = "NMPC traj. (N=12)"
+    q = "NMPC offset-free (N=12)"
     pid = "PID (tuned)"
 
     def _red(orig, new):
@@ -311,12 +317,12 @@ def main(argv=None):
                  "NMPC_patch": regimes[q][T("regime_settled")],
                  T("col_improvement"): _red(regimes[o][T("regime_settled")],
                                             regimes[q][T("regime_settled")])})
-    rows.append({T("col_metric"): "Depth-coupling max|e| (260–340 s) [°]",
+    rows.append({T("col_metric"): "Depth-coupling max|e| (255–310 s) [°]",
                  "PID": peak_depth[pid], "NMPC_orig": peak_depth[o],
                  "NMPC_patch": peak_depth[q],
                  T("col_improvement"): _red(peak_depth[o], peak_depth[q])})
     if peak_rev is not None:
-        rows.append({T("col_metric"): "Reversal overshoot max|e| (500–600 s) [°]",
+        rows.append({T("col_metric"): "Reversal max|e| (495–560 s) [°]",
                      "PID": peak_rev[pid], "NMPC_orig": peak_rev[o],
                      "NMPC_patch": peak_rev[q],
                      T("col_improvement"): _red(peak_rev[o], peak_rev[q])})
@@ -328,7 +334,7 @@ def main(argv=None):
     timing_note = ""
     if solve.get(q):
         tinfo = M.solver_timing(solve[q], dt_control=0.2)
-        timing_note = (f"Patched NMPC (N=30) solver time: mean {tinfo['mean_ms']:.1f} ms, "
+        timing_note = (f"Patched NMPC (N=12) solver time: mean {tinfo['mean_ms']:.1f} ms, "
                        f"P99 {tinfo['p99_ms']:.1f} ms, max {tinfo['max_ms']:.1f} ms; "
                        f"{100*tinfo['frac_realtime']:.1f}% of solves within deadline (200 ms).")
 

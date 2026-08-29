@@ -54,7 +54,7 @@ BOUNDS = [0.0] + SWITCH + [T_FINAL]
 # Update these if controller names change in run_remus100_comparison.py.
 CONTROLLERS = {
     "PID (tuned)":             "PID_tuned",
-    "NMPC offset-free (N=30)": "NMPC_offset-free_N30",
+    "NMPC offset-free (N=12)": "NMPC_offset-free_N12",
 }
 
 
@@ -143,7 +143,7 @@ def main():
     # ---------------- figures ----------------
     f1 = P.plot_regime_comparison(
         regimes, os.path.join(OUTDIR, "s6_regime_comparison.png"),
-        title="Heading RMSE by regime: aggregate masks the regime switch")
+        title=T("s6_regime_title"))
     f2 = P.plot_segment_breakdown(
         seg, os.path.join(OUTDIR, "s6_segment_breakdown.png"),
         turn_labels=_turn_labels(), metric="iae", unit="°·s")
@@ -151,18 +151,13 @@ def main():
         {n: e for n, e in err_deg.items()},
         os.path.join(OUTDIR, "s6_error_ecdf.png"))
     f4 = P.plot_spike_zoom(
-        t, series_deg, ref_deg, (490, 570),
+        t, series_deg, ref_deg, (495, 560),
         os.path.join(OUTDIR, "s6_zoom_reversal.png"),
-        title="Sharp heading reversal overshoot (330°→45°→0°)",
-        note="NMPC makes an aggressive initial manoeuvre and overshoots the target; "
-             "tuned PID is slower but without a large overshoot.")
+        title=T("s6_zoom_rev_title"))
     f5 = P.plot_spike_zoom(
-        t, series_deg, ref_deg, (255, 335),
+        t, series_deg, ref_deg, (255, 310),
         os.path.join(OUTDIR, "s6_zoom_depthcoupling.png"),
-        title="Depth-coupling heading excursion (constant heading 200°)",
-        note="Heading is constant (200°) in this segment, but depth changes 40→10 m. "
-             "The reduced NMPC predictor ignores pitch→yaw coupling, so heading drifts "
-             "during the ascent.")
+        title=T("s6_zoom_depth_title"))
     # mission overview with the two events annotated
     nmpc_name = next(n for n in err_deg if "NMPC" in n)
     i_rev = int(np.argmax(np.abs(err_deg[nmpc_name])))
@@ -173,9 +168,9 @@ def main():
         os.path.join(OUTDIR, "s6_mission_overview.png"),
         events=[
             (t[i_dep], err_deg[nmpc_name][i_dep],
-             f"  depth coupling {err_deg[nmpc_name][i_dep]:+.0f}°"),
+             "  " + T("event_depth_coupling").format(val=err_deg[nmpc_name][i_dep])),
             (t[i_rev], err_deg[nmpc_name][i_rev],
-             f"  reversal overshoot {err_deg[nmpc_name][i_rev]:+.0f}°"),
+             "  " + T("event_reversal").format(val=err_deg[nmpc_name][i_rev])),
         ])
 
     # ---------------- reports ----------------
