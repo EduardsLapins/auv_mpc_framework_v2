@@ -262,7 +262,15 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
         dist = gauss_markov_current(s, t_final)
         print(f"  seed {s:2d}  mean current {dist.mean_speed:.2f} m/s ... ", end="", flush=True)
 
-        # --- PID ---
+        # --- Fossen builtin autopilot (baseline; appears only in the
+        #     "_ar_fossen" figure variants and the stats tables) ---
+        a_fossen = fw.FossenVehicleAdapter()
+        r_fossen = a_fossen.run_builtin_autopilot(
+            t_final, z_d, psi_d, 1525, dist.mean_speed, 170.0,
+            disturbance_fn=dist, reference_fn=ref)
+        r_fossen.controller_name = "Fossen PID/SMC"
+
+        # --- PID 50 Hz ---
         pid = fw.make_pid()
         a_pid = fw.FossenVehicleAdapter()
         r_pid = a_pid.run(t_final, fw.wrap_pid(pid), ref, sampleTime=0.02,
@@ -276,7 +284,7 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
                             disturbance_fn=dist)
         r_nmpc.controller_name = nmpc.name
 
-        for r in (r_pid, r_nmpc):
+        for r in (r_fossen, r_pid, r_nmpc):
             t, z, z_ref, psi, psi_ref = _extract_signals(r)
             zm = metrics.tracking_metrics(t, z, z_ref)
             pm = metrics.tracking_metrics(t, psi, psi_ref, angular=True)
@@ -293,7 +301,8 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
 
     # ---- summarise + paired stats -------------------------------------------
     names = list(acc)
-    pid_name, nmpc_name = names
+    nmpc_name = next(nm for nm in names if nm.upper().startswith("NMPC"))
+    pid_names = [nm for nm in names if nm != nmpc_name]
     rows = []
     for metric_key, label, unit in [
         ("z_rmse", "Dziļuma RMSE", "m"),
@@ -314,31 +323,44 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
                 "n": st["n"],
             })
 
-    cmp_psi = metrics.paired_comparison(
-        acc[pid_name]["psi_rmse"],
-        acc[nmpc_name]["psi_rmse"],
-        labels=("PID", "NMPC"))
-    cmp_settled = metrics.paired_comparison(
-        acc[pid_name]["psi_settled"],
-        acc[nmpc_name]["psi_settled"],
-        labels=("PID", "NMPC"))
+    # Paired comparison of every PID variant against the NMPC (same seeds).
+    cmps = {}
+    for pn in pid_names:
+        cmps[pn] = {
+            "psi": metrics.paired_comparison(
+                acc[pn]["psi_rmse"], acc[nmpc_name]["psi_rmse"],
+                labels=(pn, "NMPC")),
+            "settled": metrics.paired_comparison(
+                acc[pn]["psi_settled"], acc[nmpc_name]["psi_settled"],
+                labels=(pn, "NMPC")),
+        }
 
     # ---- figures ------------------------------------------------------------
-    f_rmse = plotting.plot_metric_boxes(
-        {nm: acc[nm]["psi_rmse"] for nm in names},
-        os.path.join(out_dir, "mc_heading_rmse_box.png"),
-        ylabel="Kursa RMSE [°]",
-        title=f"Kursa RMSE sadalījums {n_seeds} testos ar nejaušiem trokšņiem")
-    f_settled = plotting.plot_metric_boxes(
-        {nm: acc[nm]["psi_settled"] for nm in names},
-        os.path.join(out_dir, "mc_heading_settled_box.png"),
-        ylabel="Miera stāvokļa kursa RMSE [°]",
-        title=f"Miera stāvokļa precizitāte {n_seeds} testos ar nejaušiem trokšņiem")
-    f_depth = plotting.plot_metric_boxes(
-        {nm: acc[nm]["z_rmse"] for nm in names},
-        os.path.join(out_dir, "mc_depth_rmse_box.png"),
-        ylabel="Dziļuma RMSE [m]",
-        title=f"Dziļuma RMSE sadalījums {n_seeds} testos ar nejaušiem trokšņiem")
+    # Default boxplots exclude the Fossen baseline (its ~tens-of-degrees
+    # errors flatten the PID/NMPC boxes); "_ar_fossen" variants include it.
+    box_names = [nm for nm in names if nm != "Fossen PID/SMC"]
+
+    def _boxes(nms, sfx):
+        a = plotting.plot_metric_boxes(
+            {nm: acc[nm]["psi_rmse"] for nm in nms},
+            os.path.join(out_dir, f"mc_heading_rmse_box{sfx}.png"),
+            ylabel="Kursa RMSE [°]",
+            title=f"Kursa RMSE sadalījums {n_seeds} testos ar nejaušiem trokšņiem")
+        b = plotting.plot_metric_boxes(
+            {nm: acc[nm]["psi_settled"] for nm in nms},
+            os.path.join(out_dir, f"mc_heading_settled_box{sfx}.png"),
+            ylabel="Miera stāvokļa kursa RMSE [°]",
+            title=f"Miera stāvokļa precizitāte {n_seeds} testos ar nejaušiem trokšņiem")
+        c = plotting.plot_metric_boxes(
+            {nm: acc[nm]["z_rmse"] for nm in nms},
+            os.path.join(out_dir, f"mc_depth_rmse_box{sfx}.png"),
+            ylabel="Dziļuma RMSE [m]",
+            title=f"Dziļuma RMSE sadalījums {n_seeds} testos ar nejaušiem trokšņiem")
+        return a, b, c
+
+    f_rmse, f_settled, f_depth = _boxes(box_names, "")
+    if box_names != names:
+        _boxes(names, "_ar_fossen")
 
     # ---- tables -------------------------------------------------------------
     csv_path = report.write_csv(
@@ -347,19 +369,26 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
          "CI_zem", "CI_virs", "n"],
         os.path.join(out_dir, "mc_summary.csv"))
 
-    def _fmt_cmp(c):
-        return (f"vidējā starpība (PID−NMPC) = {c['mean_diff']:+.3f}, "
+    def _fmt_cmp(c, who):
+        return (f"vidējā starpība ({who}−NMPC) = {c['mean_diff']:+.3f}, "
                 f"Cohen dz = {c['cohen_dz']:.2f}, "
                 f"paired-t p = {c['paired_t_p']:.2e}, "
                 f"Wilcoxon p = {c['wilcoxon_p']:.2e} (n={c['n']})")
 
+    cmp_lines = ""
+    for pn in pid_names:
+        cmp_lines += (
+            f"- Kopējais kursa RMSE ({pn} pret NMPC): "
+            f"{_fmt_cmp(cmps[pn]['psi'], pn)}.\n"
+            f"- Miera stāvokļa kursa RMSE ({pn} pret NMPC): "
+            f"{_fmt_cmp(cmps[pn]['settled'], pn)}.\n")
+
     body = (
         f"Veikti {n_seeds} testi ar neatkarīgiem, ar sēklu noteiktiem nejaušiem "
         f"straumes trokšņiem (Gausa–Markova ātrums + viļņu komponente + "
-        f"Gausa–Markova virziens). Katrā testā abi kontrolieri saņem identisku "
+        f"Gausa–Markova virziens). Katrā testā visi kontrolieri saņem identisku "
         f"trokšņa realizāciju, tāpēc salīdzinājums ir pārī (paired).\n\n"
-        f"- Kopējais kursa RMSE: {_fmt_cmp(cmp_psi)}.\n"
-        f"- Miera stāvokļa kursa RMSE: {_fmt_cmp(cmp_settled)}.\n\n"
+        f"{cmp_lines}\n"
         f"Pozitīva vidējā starpība nozīmē, ka PID kļūda ir lielāka (NMPC labāks); "
         f"negatīva — pretēji. |Cohen dz| ≳ 0,8 norāda lielu efektu.\n"
     )
@@ -372,10 +401,11 @@ def run_monte_carlo(n_seeds: int, out_dir: str, *, quick: bool = False) -> dict:
              ["Metrika", "Kontrolieris", "Vidējais", "Std", "Mediāna",
               "CI_zem", "CI_virs"]))])
 
-    print(f"[EXP-A] heading RMSE: {_fmt_cmp(cmp_psi)}")
-    print(f"[EXP-A] settled RMSE: {_fmt_cmp(cmp_settled)}")
+    for pn in pid_names:
+        print(f"[EXP-A] heading RMSE ({pn}): {_fmt_cmp(cmps[pn]['psi'], pn)}")
+        print(f"[EXP-A] settled RMSE ({pn}): {_fmt_cmp(cmps[pn]['settled'], pn)}")
     print(f"[EXP-A] wrote {f_rmse}, {f_settled}, {f_depth}, {csv_path}, {md_path}")
-    return {"rows": rows, "paired_psi": cmp_psi, "paired_settled": cmp_settled,
+    return {"rows": rows, "paired": cmps,
             "figures": [f_rmse, f_settled, f_depth], "csv": csv_path, "md": md_path}
 
 

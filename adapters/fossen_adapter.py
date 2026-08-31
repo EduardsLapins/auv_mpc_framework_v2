@@ -226,13 +226,18 @@ class FossenVehicleAdapter:
     def run_builtin_autopilot(self, t_final: float, z_d: float, psi_d: float,
                                n_d: float = 1525, V_c: float = 0.5,
                                beta_c: float = 170,
-                               disturbance_fn: Callable = None) -> SimulationResult:
+                               disturbance_fn: Callable = None,
+                               reference_fn: Callable = None) -> SimulationResult:
         """
         Run with Fossen's built-in depth+heading autopilot for baseline comparison.
 
         This is useful to verify our controllers against the reference implementation.
         ``disturbance_fn(t) -> (V_c, beta_c_deg)`` optionally applies the same
         time-varying current as run(), so the baseline faces identical conditions.
+        ``reference_fn(t) -> (eta_d [6,], nu_d [6,])`` optionally feeds the
+        autopilot the same time-varying setpoints the other controllers track
+        (the vehicle reads ref_z [m] and ref_psi [deg] each step); z_d/psi_d
+        then only seed the initial setpoint.
         """
         # Create a fresh vehicle with the autopilot configured
         vehicle = remus100('depthHeadingAutopilot', z_d, psi_d, n_d, V_c, beta_c)
@@ -250,27 +255,38 @@ class FossenVehicleAdapter:
         uc_log = np.zeros((N, 3))
         ua_log = np.zeros((N, 3))
 
+        D2R = math.pi / 180
+        etad_log = np.tile(np.array([0, 0, z_d, 0, 0, psi_d * D2R]), (N, 1))
+
         for i in range(N):
             t = i * dt
             if disturbance_fn is not None:
                 V_now, beta_now_deg = disturbance_fn(t)
                 vehicle.V_c = V_now
                 vehicle.beta_c = beta_now_deg * math.pi / 180
+            if reference_fn is not None:
+                eta_d_t, _ = reference_fn(t)
+                vehicle.ref_z = float(eta_d_t[2])
+                # The autopilot's 3rd-order reference model tracks the raw
+                # difference to ref_psi without angle wrapping, so a wrapped
+                # reference (+180 deg emitted as -180) would send it the long
+                # way around.  Re-represent the command in the winding nearest
+                # the autopilot's internal state psi_d.
+                psi_raw = float(eta_d_t[5])
+                psi_near = vehicle.psi_d + (
+                    (psi_raw - vehicle.psi_d + math.pi) % (2 * math.pi) - math.pi)
+                vehicle.ref_psi = psi_near / D2R
+                etad_log[i] = eta_d_t
             u_control = vehicle.depthHeadingAutopilot(eta, nu, dt)
-            
+
             time_log[i] = t
             eta_log[i] = eta.copy()
             nu_log[i] = nu.copy()
             uc_log[i] = u_control.copy()
             ua_log[i] = u_actual.copy()
-            
+
             [nu, u_actual] = vehicle.dynamics(eta, nu, u_actual, u_control, dt)
             eta = attitudeEuler(eta, nu, dt)
-        
-        # Target reference
-        D2R = math.pi / 180
-        eta_d = np.array([0, 0, z_d, 0, 0, psi_d * D2R])
-        etad_log = np.tile(eta_d, (N, 1))
         
         return SimulationResult(
             time=time_log, eta=eta_log, nu=nu_log,

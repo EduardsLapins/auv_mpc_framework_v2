@@ -412,21 +412,32 @@ def tracking_errors(result):
 
 
 def compute_metrics(result, tz: float | None = None, tp_deg: float | None = None,
-                    t0: float = 50.0):
-    """Simple final-target metrics for scenarios 1-5."""
+                    t0: float = 0.0, ref=None):
+    """Whole-run tracking metrics for scenarios 1-5.
+
+    When ``ref`` (callable t -> (eta_d, nu_d)) is given, errors are measured
+    against the time-varying mission reference over the full run, transient
+    included.  Otherwise errors fall back to the recorded eta_d or the
+    constant final target.  ``t0`` optionally skips the start of the run.
+    """
     mask = result.time >= t0
     if not mask.any():
         mask = np.ones(len(result.time), dtype=bool)
 
-    if tz is None and result.eta_d is not None:
-        z_ref = result.eta_d[:, 2]
+    if ref is not None:
+        ref_poses = np.array([ref(t)[0] for t in result.time])
+        z_ref = ref_poses[:, 2]
+        psi_ref = ref_poses[:, 5]
     else:
-        z_ref = np.full_like(result.time, float(tz))
+        if tz is None and result.eta_d is not None:
+            z_ref = result.eta_d[:, 2]
+        else:
+            z_ref = np.full_like(result.time, float(tz))
 
-    if tp_deg is None and result.eta_d is not None:
-        psi_ref = result.eta_d[:, 5]
-    else:
-        psi_ref = np.full_like(result.time, float(tp_deg) * D2R)
+        if tp_deg is None and result.eta_d is not None:
+            psi_ref = result.eta_d[:, 5]
+        else:
+            psi_ref = np.full_like(result.time, float(tp_deg) * D2R)
 
     ze = result.eta[mask, 2] - z_ref[mask]
     pe = _wrap_to_pi(result.eta[mask, 5] - psi_ref[mask])
@@ -436,8 +447,7 @@ def compute_metrics(result, tz: float | None = None, tp_deg: float | None = None
     }
 
 
-def plot_scenario(results, path: str, title: str, tz: float | None = None,
-                  tp: float | None = None):
+def plot_scenario(results, path: str, title: str):
     fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
     fig.suptitle(title, fontsize=14, fontweight="bold")
 
@@ -449,10 +459,14 @@ def plot_scenario(results, path: str, title: str, tz: float | None = None,
         spd = np.sqrt(np.sum(r.nu[:, :3] ** 2, axis=1))
         axes[2].plot(r.time, spd, color=c, label=r.controller_name, lw=1.5)
 
-    if tz is not None:
-        axes[0].axhline(y=tz, color="gray", ls="--", alpha=0.5, label=T("target"))
-    if tp is not None:
-        axes[1].axhline(y=tp, color="gray", ls="--", alpha=0.5, label=T("target"))
+    # Common mission reference (all controllers track the same trajectory)
+    ref_r = results[-1]
+    if ref_r.eta_d is not None:
+        axes[0].plot(ref_r.time, ref_r.eta_d[:, 2], color="k", ls="--", lw=1,
+                     alpha=0.6, label=T("reference"))
+        plot_heading_continuous(axes[1], ref_r.time, ref_r.eta_d[:, 5],
+                                label=T("reference"), color="k", lw=1, ls="--",
+                                alpha=0.6, anchor_deg=0.0)
 
     axes[0].set_ylabel(T("depth_m"))
     axes[0].set_title(T("depth_tracking"))
@@ -478,6 +492,40 @@ def plot_scenario(results, path: str, title: str, tz: float | None = None,
     plt.close()
 
 
+FOSSEN_NAME = "Fossen PID/SMC"
+
+# Rows accumulated by every scenario run, written by main() to one CSV.
+SCENARIO_METRICS: list[dict] = []
+
+
+def record_scenario_metrics(tag: str, results):
+    for r in results:
+        e = tracking_errors(r)
+        SCENARIO_METRICS.append({
+            "scenario": tag,
+            "controller": r.controller_name,
+            "z_rmse_m": f"{e['z_rmse']:.4f}",
+            "z_mae_m": f"{e['z_mae']:.4f}",
+            "z_iae_m_s": f"{e['z_iae']:.2f}",
+            "psi_rmse_deg": f"{e['psi_rmse_deg']:.4f}",
+            "psi_mae_deg": f"{e['psi_mae_deg']:.4f}",
+            "psi_max_deg": f"{e['psi_max_deg']:.4f}",
+            "psi_iae_deg_s": f"{e['psi_iae_deg_s']:.2f}",
+        })
+
+
+def write_scenario_metrics_csv(out: str) -> str:
+    path = os.path.join(out, "scenario_metrics.csv")
+    cols = ["scenario", "controller", "z_rmse_m", "z_mae_m", "z_iae_m_s",
+            "psi_rmse_deg", "psi_mae_deg", "psi_max_deg", "psi_iae_deg_s"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(SCENARIO_METRICS)
+    print(f"    Saved: {path}")
+    return path
+
+
 def run_three(t_final, z_d, psi_d, Vc, bc, ref, tag, out, title, *, seed=0):
     # Every scenario runs against a seeded time-varying current realisation
     # (identical for all three controllers); controllers only know the mean.
@@ -487,7 +535,7 @@ def run_three(t_final, z_d, psi_d, Vc, bc, ref, tag, out, title, *, seed=0):
     print("    Fossen autopilot...")
     a = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
     r1 = a.run_builtin_autopilot(t_final, z_d, psi_d, 1525, Vc, bc,
-                                 disturbance_fn=dist)
+                                 disturbance_fn=dist, reference_fn=ref)
     r1.controller_name = "Fossen PID/SMC"
     results.append(r1)
 
@@ -507,11 +555,14 @@ def run_three(t_final, z_d, psi_d, Vc, bc, ref, tag, out, title, *, seed=0):
     results.append(r3)
 
     for r in results:
-        m = compute_metrics(r, z_d, psi_d)
+        m = compute_metrics(r, z_d, psi_d, ref=ref)
         print(f"      {r.controller_name:28s}: z_RMSE={m['z_rmse']:.3f} m, "
               f"psi_RMSE={m['psi_rmse_deg']:.2f} deg")
+    record_scenario_metrics(tag, results)
 
-    plot_scenario(results, f"{out}/{tag}.png", title, z_d, psi_d)
+    plot_scenario(results, f"{out}/{tag}.png", title)
+    plot_scenario([r for r in results if r.controller_name != FOSSEN_NAME],
+                  f"{out}/{tag}_bez_fossen.png", title)
     return results
 
 
@@ -555,42 +606,14 @@ def scenario_3(out):
 
 def scenario_4(out):
     print("\n" + "=" * 70 + "\n  SCENARIO 4: Multi-waypoint mission\n" + "=" * 70)
-    ref = smooth_ref([(0, 0), (20, 30), (40, 120), (20, 30)], [5.0, 100.0, 200.0],
-                     tau_rise=15.0)
-    dist = varying_current(4, 400, 0.5, 170)
-    nmpc = make_nmpc(0.5, 170)
-    a = FossenVehicleAdapter(V_current=0.5, beta_current=170)
-    r = a.run(400, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02, disturbance_fn=dist)
-    r.controller_name = nmpc.name
-
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-    fig.suptitle(T("s4_title").format(name=r.controller_name),
-                 fontsize=14, fontweight="bold")
-
-    axes[0].plot(r.time, r.eta[:, 2], "g-",
-                 label=f"{r.controller_name} {T('depth_label')}", lw=1.5)
-    axes[0].plot(r.time, r.eta_d[:, 2], "k--", label=T("reference"), lw=1, alpha=0.6)
-    axes[0].set_ylabel(T("depth_m"))
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    plot_heading_continuous(axes[1], r.time, r.eta[:, 5],
-                            label=f"{r.controller_name} {T('heading_label')}", color="g", lw=1.5,
-                            anchor_deg=0.0)
-    plot_heading_continuous(axes[1], r.time, r.eta_d[:, 5],
-                            label=T("reference"), color="k", lw=1, ls="--", alpha=0.6,
-                            anchor_deg=0.0)
-    axes[1].set_ylabel(T("heading_deg"))
-    axes[1].set_xlabel(T("time_s"))
-    axes[1].margins(y=0.08)
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
-    plt.tight_layout(rect=(0, 0, 1, 0.94))
-    path = f"{out}/s4_daudzpunkti.png"
-    plt.savefig(path, dpi=200)
-    print(f"    Saved: {path}")
-    plt.close()
+    return run_three(
+        400, 20, 30, 0.5, 170,
+        smooth_ref([(0, 0), (20, 30), (40, 120), (20, 30)], [5.0, 100.0, 200.0],
+                   tau_rise=15.0),
+        "s4_daudzpunkti", out,
+        T("s4_title"),
+        seed=4,
+    )
 
 
 def scenario_5(out):
@@ -707,6 +730,15 @@ def scenario_6_complex(out):
     r_pid50.controller_name = "PID (tuned)"
     results.append(r_pid50)
 
+    # Fossen builtin autopilot — baseline, follows the same mission reference
+    print("    Fossen autopilot...")
+    a_fossen = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
+    r_fossen = a_fossen.run_builtin_autopilot(t_final, 0.0, 0.0, 1525, Vc, bc,
+                                              disturbance_fn=dist,
+                                              reference_fn=ref)
+    r_fossen.controller_name = "Fossen PID/SMC"
+    results.append(r_fossen)
+
     # PID at 5 Hz — rate-matched to NMPC (same gains, slower feedback loop)
     print("    PID (5 Hz) — rate-matched to NMPC...")
     pid_5 = make_pid()
@@ -769,6 +801,23 @@ def scenario_6_complex(out):
             ])
     print(f"    Saved: {times_path}")
 
+    record_scenario_metrics("s6_kompleksa_trajektorija", results)
+    _plot_s6_figures(results, switch_times, out)
+    _plot_s6_figures([r for r in results if r.controller_name != FOSSEN_NAME],
+                     switch_times, out, suffix="_bez_fossen")
+
+    print(
+        "\n  Interpretation: if heading error is large immediately after switch points, "
+        "this is typically a transient-regime effect.  The heading error is computed as "
+        "the shortest angular difference wrap(heading - reference) in [-180, 180], "
+        "and the figure shows where this error actually accumulates."
+    )
+
+    return results
+
+
+def _plot_s6_figures(results, switch_times, out, suffix=""):
+    """Scenario-6 six-panel + top-view figures for the given controller subset."""
     fig, axes = plt.subplots(6, 1, figsize=(16, 21), sharex=True)
     fig.suptitle(T("s6_title"), fontsize=14, fontweight="bold")
 
@@ -803,10 +852,11 @@ def scenario_6_complex(out):
         ax5b.plot(r.time, e["cum_abs_psi_deg"], color=c, ls="--",
                   label=f"{r.controller_name} {T('int_epsi')}", lw=1.2, alpha=0.8)
 
-    if r3.eta_d is not None:
-        axes[0].plot(r3.time, r3.eta_d[:, 2], "k--", lw=1, alpha=0.4,
+    ref_r = results[-1]
+    if ref_r.eta_d is not None:
+        axes[0].plot(ref_r.time, ref_r.eta_d[:, 2], "k--", lw=1, alpha=0.4,
                      label=T("reference"))
-        plot_heading_continuous(axes[1], r3.time, r3.eta_d[:, 5],
+        plot_heading_continuous(axes[1], ref_r.time, ref_r.eta_d[:, 5],
                                 label=T("reference"), color="k", lw=1, ls="--",
                                 alpha=0.4, anchor_deg=0.0)
 
@@ -853,7 +903,7 @@ def scenario_6_complex(out):
                    loc="best", fontsize=7, ncol=2)
 
     plt.tight_layout(rect=(0, 0, 1, 0.975))
-    path = f"{out}/s6_kompleksa_trajektorija.png"
+    path = f"{out}/s6_kompleksa_trajektorija{suffix}.png"
     plt.savefig(path, dpi=200)
     print(f"    Saved: {path}")
     plt.close()
@@ -890,19 +940,10 @@ def scenario_6_complex(out):
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right", fontsize=8.5)
     plt.tight_layout()
-    path_xy = f"{out}/s6_trajektorija_xy.png"
+    path_xy = f"{out}/s6_trajektorija_xy{suffix}.png"
     plt.savefig(path_xy, dpi=200)
     print(f"    Saved: {path_xy}")
     plt.close()
-
-    print(
-        "\n  Interpretation: if heading error is large immediately after switch points, "
-        "this is typically a transient-regime effect.  The heading error is computed as "
-        "the shortest angular difference wrap(heading - reference) in [-180, 180], "
-        "and the figure shows where this error actually accumulates."
-    )
-
-    return results
 
 
 def main():
@@ -927,6 +968,8 @@ def main():
         print(f"\n  Error: {e}")
         import traceback
         traceback.print_exc()
+
+    write_scenario_metrics_csv(out)
 
     print("\n" + "=" * 70 + "\n  ALL SCENARIOS COMPLETE\n  Results: " + out +
           "\n" + "=" * 70)

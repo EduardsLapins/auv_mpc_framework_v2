@@ -213,25 +213,20 @@ def _zoom_overlay(t, ref_cont_deg, runs, window, path, *, title):
                                      gridspec_kw={"height_ratios": [2, 1]})
     ax_h.plot(t[mask], ref_cont_deg[mask], color=COL["reference"], lw=1.6,
               ls="--", label=T("reference"))
-    for name in ("PID (tuned)", "NMPC traj. (N=12)", "NMPC offset-free (N=12)"):
-        if name not in runs:
-            continue
+    for name in runs:
         ax_h.plot(t[mask], runs[name]["heading_cont_deg"][mask],
-                  color=COL[name], lw=2.0, label=name)
+                  color=COL.get(name, P.controller_color(name)), lw=2.0,
+                  label=name)
     ax_h.set_ylabel(T("hdg_continuous"))
+    # absolute tick labels (e.g. 200.05), not matplotlib's "+2e2" offset form
+    ax_h.ticklabel_format(axis="y", useOffset=False)
     ax_h.set_title(title, fontsize=12, fontweight="bold")
     ax_h.legend(loc="best")
 
-    for name in ("PID (tuned)", "NMPC traj. (N=12)", "NMPC offset-free (N=12)"):
-        if name not in runs:
-            continue
+    for name in runs:
         e = np.abs(runs[name]["err_deg"][mask])
-        ax_e.plot(t[mask], e, color=COL[name], lw=1.8, label=name)
-        pk_i = int(np.argmax(e))
-        ax_e.annotate(f"max {e[pk_i]:.1f}°",
-                      xy=(t[mask][pk_i], e[pk_i]),
-                      xytext=(8, 6), textcoords="offset points",
-                      fontsize=9, color=COL[name], fontweight="bold")
+        ax_e.plot(t[mask], e, color=COL.get(name, P.controller_color(name)),
+                  lw=1.8, label=name)
     ax_e.set_ylabel(T("hdg_err_abs"))
     ax_e.set_xlabel(T("time_s"))
     ax_e.grid(True, alpha=0.3)
@@ -283,6 +278,47 @@ def main(argv=None):
             os.path.join(args.out, "patch_zoom_reversal.png"),
             title=T("patch_zoom_rev_title"))
         figs.append(f_rev)
+
+    # ---- "_ar_fossen" figure variants: merge the Fossen baseline from the
+    # scenario-6 CSV (same seed-6 current realisation, same 50 Hz grid) ----
+    s6_path = os.path.join(os.path.dirname(args.out), "s6_kursa_kludas_analize.csv")
+    runs_f = None
+    if os.path.exists(s6_path):
+        import pandas as _pd
+        df6 = _pd.read_csv(s6_path)
+        pfx = "Fossen_PID/SMC"
+        if (f"{pfx}_heading_continuous_deg" in df6.columns
+                and len(df6) == len(t)):
+            runs_f = {
+                "Fossen PID/SMC": {
+                    "t": t,
+                    "heading_cont_deg": df6[f"{pfx}_heading_continuous_deg"].values,
+                    "err_deg": df6[f"{pfx}_heading_error_deg"].values,
+                },
+                **runs,
+            }
+    if runs_f is not None:
+        agg_f, regimes_f, seg_f = _compute_metrics(t, ref_cont, runs_f, bounds)
+        P.plot_regime_comparison(
+            regimes_f,
+            os.path.join(args.out, "patch_regime_comparison_ar_fossen.png"),
+            title=T("patch_regime_title"))
+        P.plot_segment_breakdown(
+            seg_f,
+            os.path.join(args.out, "patch_segment_breakdown_ar_fossen.png"),
+            turn_labels=_turn_labels(bounds), metric="iae", unit="°·s")
+        _zoom_overlay(
+            t, ref_cont, runs_f, WIN_DEPTH,
+            os.path.join(args.out, "patch_zoom_depthcoupling_ar_fossen.png"),
+            title=T("patch_zoom_depth_title"))
+        if not args.quick:
+            _zoom_overlay(
+                t, ref_cont, runs_f, WIN_REVERSAL,
+                os.path.join(args.out, "patch_zoom_reversal_ar_fossen.png"),
+                title=T("patch_zoom_rev_title"))
+    else:
+        print("[compare_nmpc_patch] no matching Fossen data in s6 CSV — "
+              "skipping _ar_fossen figure variants")
 
     # ---- save time-series CSV for thesis_analysis.py ----
     ts_path = os.path.join(args.out, "patch_compare_timeseries.csv")

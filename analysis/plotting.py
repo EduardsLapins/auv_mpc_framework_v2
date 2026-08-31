@@ -98,20 +98,6 @@ def setup_style():
     )
 
 
-def _annotate(ax, text, xy, xytext, *, color="#202124"):
-    ax.annotate(
-        text,
-        xy=xy,
-        xytext=xytext,
-        fontsize=8.5,
-        color=color,
-        ha="left",
-        va="center",
-        arrowprops=dict(arrowstyle="->", color=color, lw=1.0, alpha=0.8),
-        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color, alpha=0.9, lw=0.8),
-    )
-
-
 # --------------------------------------------------------------------------- #
 #  1. Steady-state vs transient reframe
 # --------------------------------------------------------------------------- #
@@ -332,24 +318,12 @@ def plot_spike_zoom(
     fig, ax = plt.subplots(figsize=(7.6, 4.2))
     ax.plot(t[m], np.asarray(ref, float)[m], color=PALETTE["reference"], ls="--",
             lw=1.6, label=T("reference"), alpha=0.9)
-    worst_name, worst_dev, worst_t, worst_val = None, 0.0, None, None
     for n, s in series_by_controller.items():
         s = np.asarray(s, float)
         ax.plot(t[m], s[m], color=controller_color(n), lw=2, label=n)
-        dev = np.abs(s[m] - np.asarray(ref, float)[m])
-        i = int(np.argmax(dev))
-        if dev[i] > worst_dev:
-            worst_dev, worst_name = dev[i], n
-            worst_t, worst_val = t[m][i], s[m][i]
-    if worst_name is not None:
-        _annotate(
-            ax,
-            f"{worst_name}\n{T('max_deviation')} {worst_dev:.0f}{unit}",
-            (worst_t, worst_val),
-            (worst_t + 0.18 * (window[1] - window[0]), worst_val),
-            color=controller_color(worst_name),
-        )
     ax.set_xlim(*window)
+    # absolute tick labels (e.g. 200.05), not matplotlib's "+2e2" offset form
+    ax.ticklabel_format(axis="y", useOffset=False)
     ax.set_xlabel(T("time_s"))
     ax.set_ylabel(ylabel)
     if title:

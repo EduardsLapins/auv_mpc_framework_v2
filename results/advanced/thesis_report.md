@@ -2,7 +2,7 @@
 
 ## §1 Executive Summary
 
-Scenario 6 (600 s, 8-waypoint complex mission, current 0.6 m/s @ 150°) was used to compare a tuned cascaded PID and trajectory NMPC controllers on the REMUS 100 AUV.  The aggregate heading RMSE of the patched NMPC (0.25°) is lower than the PID (1.43°), but this aggregate figure is dominated by two specific transient failure modes.  In settled holding, NMPC is 11× more accurate than PID (0.052° vs 0.585° RMSE).  The patched NMPC (offset-free disturbance observer) directly addresses both failure modes identified in this analysis.
+Scenario 6 (600 s, 8-waypoint complex mission, current 0.6 m/s @ 150°) was used to compare a tuned cascaded PID and trajectory NMPC controllers on the REMUS 100 AUV.  The aggregate heading RMSE of the patched NMPC (0.25°) is lower than the PID (1.52°), but this aggregate figure is dominated by two specific transient failure modes.  In settled holding, NMPC is 1× more accurate than PID (0.052° vs 0.049° RMSE).  The patched NMPC (offset-free disturbance observer) directly addresses both failure modes identified in this analysis.
 
 ## §2 Root Cause Analysis
 
@@ -85,8 +85,8 @@ disturbance and the heading excursion is substantially reduced.
 **PID (tuned):**
 | Window | Peak error | Window IAE | % of total IAE |
 |--------|-----------|------------|----------------|
-| Depth coupling (260–340 s) | 0.7° | 32.1 °·s | 5.6% |
-| Reversal (490–570 s) | 2.1° | 67.2 °·s | 11.8% |
+| Depth coupling (260–340 s) | 0.1° | 2.6 °·s | 0.6% |
+| Reversal (490–570 s) | 1.5° | 34.3 °·s | 8.1% |
 
 **NMPC traj. (N=12) (original, reference):**
 | Window | Peak error | Window IAE | % of total IAE |
@@ -106,9 +106,12 @@ disturbance and the heading excursion is substantially reduced.
 
 | Controller | Regime | RMSE [°] | MAE [°] | IAE [°·s] | P95 [°] | P99 [°] | Max |e| [°] |
 |---|---|---|---|---|---|---|---|
-| PID (tuned) | aggregate | 1.435 | 0.947 | 568.4 | 3.82 | 4.71 | 4.91 |
-| PID (tuned) | transient | 2.498 | 2.053 | 359.4 | 4.59 | 4.88 | 4.91 |
-| PID (tuned) | settled | 0.585 | 0.511 | 122.6 | 0.92 | 0.98 | 0.99 |
+| Fossen PID/SMC | aggregate | 33.622 | 22.286 | 13371.6 | 75.97 | 89.81 | 91.54 |
+| Fossen PID/SMC | transient | 44.294 | 34.612 | 6057.1 | 81.66 | 87.48 | 89.86 |
+| Fossen PID/SMC | settled | 23.349 | 15.310 | 3674.4 | 52.55 | 67.50 | 74.25 |
+| PID (tuned) | aggregate | 1.524 | 0.704 | 422.6 | 4.34 | 5.08 | 5.44 |
+| PID (tuned) | transient | 2.785 | 2.185 | 382.4 | 4.95 | 5.38 | 5.44 |
+| PID (tuned) | settled | 0.049 | 0.046 | 11.0 | 0.06 | 0.08 | 0.08 |
 | NMPC traj. (N=12) | aggregate | 1.609 | 0.694 | 416.5 | 4.50 | 5.90 | 6.28 |
 | NMPC traj. (N=12) | transient | 2.926 | 2.134 | 373.4 | 5.81 | 6.12 | 6.28 |
 | NMPC traj. (N=12) | settled | 0.053 | 0.034 | 8.0 | 0.10 | 0.10 | 0.17 |
@@ -118,27 +121,60 @@ disturbance and the heading excursion is substantially reduced.
 
 ## §4 Statistical Significance
 
+#### Fossen PID/SMC  vs  PID (tuned)
+
+| Statistic | Value |
+|-----------|-------|
+| n (mission segments) | 9 |
+| Mean difference [°] | 18.840 |
+| 95% CI [°] | [4.712, 32.969] |
+| Paired t-test p-value | 0.0152 |
+| Wilcoxon p-value | 0.0039 |
+| Cohen's d_z | 1.025 (large) |
+
+#### Fossen PID/SMC  vs  NMPC traj. (N=12)
+
+| Statistic | Value |
+|-----------|-------|
+| n (mission segments) | 9 |
+| Mean difference [°] | 18.842 |
+| 95% CI [°] | [4.705, 32.979] |
+| Paired t-test p-value | 0.0153 |
+| Wilcoxon p-value | 0.0195 |
+| Cohen's d_z | 1.024 (large) |
+
+#### Fossen PID/SMC  vs  NMPC offset-free (N=12)
+
+| Statistic | Value |
+|-----------|-------|
+| n (mission segments) | 9 |
+| Mean difference [°] | 19.336 |
+| 95% CI [°] | [4.753, 33.918] |
+| Paired t-test p-value | 0.0156 |
+| Wilcoxon p-value | 0.0195 |
+| Cohen's d_z | 1.019 (large) |
+
 #### PID (tuned)  vs  NMPC traj. (N=12)
 
 | Statistic | Value |
 |-----------|-------|
 | n (mission segments) | 9 |
-| Mean difference [°] | 0.204 |
-| 95% CI [°] | [0.020, 0.388] |
-| Paired t-test p-value | 0.0337 |
-| Wilcoxon p-value | 0.0547 |
-| Cohen's d_z | 0.853 (large) |
+| Mean difference [°] | 0.001 |
+| 95% CI [°] | [-0.070, 0.073] |
+| Paired t-test p-value | 0.9659 |
+| Wilcoxon p-value | 0.8203 |
+| Cohen's d_z | 0.015 (small) |
 
 #### PID (tuned)  vs  NMPC offset-free (N=12)
 
 | Statistic | Value |
 |-----------|-------|
 | n (mission segments) | 9 |
-| Mean difference [°] | 0.698 |
-| 95% CI [°] | [0.248, 1.148] |
-| Paired t-test p-value | 0.0072 |
-| Wilcoxon p-value | 0.0195 |
-| Cohen's d_z | 1.193 (large) |
+| Mean difference [°] | 0.495 |
+| 95% CI [°] | [0.037, 0.953] |
+| Paired t-test p-value | 0.0374 |
+| Wilcoxon p-value | 0.0742 |
+| Cohen's d_z | 0.831 (large) |
 
 #### NMPC traj. (N=12)  vs  NMPC offset-free (N=12)
 
@@ -154,17 +190,17 @@ disturbance and the heading excursion is substantially reduced.
 
 ## §5 Per-Segment Breakdown
 
-| Segment | Manoeuvre | PID (tuned) IAE [°·s] | PID (tuned) SS [°] | NMPC traj. (N=12) IAE [°·s] | NMPC traj. (N=12) SS [°] | NMPC offset-free (N=12) IAE [°·s] | NMPC offset-free (N=12) SS [°] |
-|---|---|---|---|---|---|---|---|
-| 0–5 s | miera stāvoklis | 0.0 | 0.006 | 0.3 | 0.142 | 0.4 | 0.162 |
-| 5–60 s | miera stāvoklis | 0.6 | 0.005 | 6.0 | 0.100 | 5.9 | 0.098 |
-| 60–120 s | pagrieziens +90° | 87.6 | 0.450 | 74.5 | 0.005 | 11.3 | 0.005 |
-| 120–180 s | miera stāvoklis | 20.5 | 0.300 | 1.3 | 0.005 | 1.2 | 0.005 |
-| 180–260 s | pagrieziens +110° | 124.8 | 0.751 | 111.1 | 0.005 | 16.1 | 0.005 |
-| 260–340 s | miera stāvoklis | 41.7 | 0.435 | 1.4 | 0.007 | 1.3 | 0.006 |
-| 340–420 s | pagrieziens +130° | 126.6 | 0.889 | 133.6 | 0.002 | 14.9 | 0.002 |
-| 420–500 s | pagrieziens +75° | 91.9 | 0.834 | 56.7 | 0.033 | 13.4 | 0.032 |
-| 500–600 s | pagrieziens -45° | 74.8 | 0.284 | 31.6 | 0.096 | 13.5 | 0.093 |
+| Segment | Manoeuvre | Fossen PID/SMC IAE [°·s] | Fossen PID/SMC SS [°] | PID (tuned) IAE [°·s] | PID (tuned) SS [°] | NMPC traj. (N=12) IAE [°·s] | NMPC traj. (N=12) SS [°] | NMPC offset-free (N=12) IAE [°·s] | NMPC offset-free (N=12) SS [°] |
+|---|---|---|---|---|---|---|---|---|---|
+| 0–5 s | miera stāvoklis | 0.0 | 0.006 | 0.0 | 0.006 | 0.3 | 0.142 | 0.4 | 0.162 |
+| 5–60 s | miera stāvoklis | 0.6 | 0.013 | 0.6 | 0.006 | 6.0 | 0.100 | 5.9 | 0.098 |
+| 60–120 s | pagrieziens +90° | 2364.4 | 37.414 | 81.5 | 0.061 | 74.5 | 0.005 | 11.3 | 0.005 |
+| 120–180 s | miera stāvoklis | 326.3 | 1.265 | 2.8 | 0.041 | 1.3 | 0.005 | 1.2 | 0.005 |
+| 180–260 s | pagrieziens +110° | 3150.1 | 26.462 | 111.6 | 0.058 | 111.1 | 0.005 | 16.1 | 0.005 |
+| 260–340 s | miera stāvoklis | 158.1 | 0.245 | 3.2 | 0.027 | 1.4 | 0.007 | 1.3 | 0.006 |
+| 340–420 s | pagrieziens +130° | 3653.2 | 38.526 | 120.8 | 0.061 | 133.6 | 0.002 | 14.9 | 0.002 |
+| 420–500 s | pagrieziens +75° | 2418.6 | 13.324 | 65.9 | 0.052 | 56.7 | 0.033 | 13.4 | 0.032 |
+| 500–600 s | pagrieziens -45° | 1300.3 | 5.801 | 36.2 | 0.052 | 31.6 | 0.096 | 13.5 | 0.093 |
 
 ## §6 Failure Window Dissection
 
@@ -174,7 +210,8 @@ Pure ascent (40 m → 10 m) at constant heading 200°.  Heading drift is caused 
 
 | Controller | Peak error [°] | Window IAE [°·s] | % of total IAE |
 |------------|----------------|-----------------|----------------|
-| PID (tuned) | 0.7 | 32.1 | 5.6% |
+| Fossen PID/SMC | 12.7 | 206.4 | 1.5% |
+| PID (tuned) | 0.1 | 2.6 | 0.6% |
 | NMPC traj. (N=12) | 0.0 | 1.2 | 0.3% |
 | NMPC offset-free (N=12) | 0.0 | 1.2 | 1.5% |
 
@@ -184,7 +221,8 @@ Sharp heading reversal (330°→45°→0°) combined with a 45 m → 20 m climb.
 
 | Controller | Peak error [°] | Window IAE [°·s] | % of total IAE |
 |------------|----------------|-----------------|----------------|
-| PID (tuned) | 2.1 | 67.2 | 11.8% |
+| Fossen PID/SMC | 31.6 | 1095.6 | 8.2% |
+| PID (tuned) | 1.5 | 34.3 | 8.1% |
 | NMPC traj. (N=12) | 2.0 | 27.9 | 6.7% |
 | NMPC offset-free (N=12) | 0.9 | 9.9 | 12.7% |
 
@@ -196,9 +234,9 @@ Sharp heading reversal (330°→45°→0°) combined with a 45 m → 20 m climb.
    - Observer leak (τ ≈ 8 s) prevents stale disturbance estimates from persisting across unrelated mission segments.
    - Depth-rate cap (`z_rate_max = 1.0 m/s`) keeps pitch within the NMPC predictor's constraint, eliminating the modelling mismatch that had saturated the observer and amplified the coupling.
 
-3. **Regime decomposition** is essential for fair comparison: aggregate RMSE is dominated by brief transient events.  In steady-state heading holding, the NMPC is significantly more accurate than PID (0.052° vs 0.585° RMSE).
+3. **Regime decomposition** is essential for fair comparison: aggregate RMSE is dominated by brief transient events.  In steady-state heading holding, the NMPC is significantly more accurate than PID (0.052° vs 0.049° RMSE).
 
-4. **Patched NMPC aggregate RMSE = 0.25°**, settled RMSE = 0.052°.  PID aggregate RMSE = 1.43°.  Original NMPC aggregate RMSE = 1.61°. 
+4. **Patched NMPC aggregate RMSE = 0.25°**, settled RMSE = 0.052°.  PID aggregate RMSE = 1.52°.  Original NMPC aggregate RMSE = 1.61°. 
 
 5. **Limitations:** All results come from a single deterministic simulation run.  A Monte-Carlo robustness study (see `analysis/run_advanced_experiments.py`) is required to make statistical claims about the full disturbance distribution.
 

@@ -50,7 +50,7 @@ class PID_REMUS100:
         self.Kd_theta = 2.0     # pitch derivative gain
         self.Ki_theta = 0.3     # pitch integral gain
         self.theta_int = 0.0    # pitch error integral
-        self.theta_int_max = 5.0
+        self.theta_int_max = 5.0 * D2R   # anti-windup limit [±5 deg·s]
         self.Kw = 5.0           # heave velocity feedback
         
         # ─── Heading loop (PID → δ_r) ───────────────────────────
@@ -58,7 +58,7 @@ class PID_REMUS100:
         self.Kd_psi = 1.5       # heading derivative gain (yaw rate)
         self.Ki_psi = 0.02      # heading integral gain
         self.psi_int = 0.0      # heading error integral
-        self.psi_int_max = 10.0
+        self.psi_int_max = 10.0 * D2R    # anti-windup limit [±10 deg·s]
         
         # Reference smoothing (rate limiter)
         self.psi_d_smooth = 0.0

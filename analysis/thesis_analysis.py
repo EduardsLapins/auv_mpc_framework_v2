@@ -89,6 +89,24 @@ def load_data():
                     "heading_cont_deg": df[cont_col].values,
                     "err_deg": df[err_col].values,
                 }
+        # The patch CSV has no Fossen builtin run; merge it from the
+        # scenario-6 CSV (same seed/current realisation, same time grid)
+        # so the deep-dive figures include the baseline.  Put it first so
+        # it draws underneath the controllers of interest.
+        if os.path.exists(two_way_path):
+            df6 = pd.read_csv(two_way_path)
+            pfx = "Fossen_PID/SMC"
+            cont_col = f"{pfx}_heading_continuous_deg"
+            err_col = f"{pfx}_heading_error_deg"
+            if (cont_col in df6.columns and err_col in df6.columns
+                    and len(df6) == len(df)):
+                controllers = {
+                    "Fossen PID/SMC": {
+                        "heading_cont_deg": df6[cont_col].values,
+                        "err_deg": df6[err_col].values,
+                    },
+                    **controllers,
+                }
         return t, ref_deg, controllers
 
     if os.path.exists(two_way_path):
@@ -98,6 +116,7 @@ def load_data():
         ref_deg = df["reference_heading_continuous_deg"].values
         # Map stable internal names to CSV column prefixes
         col_map = {
+            "Fossen PID/SMC":          "Fossen_PID/SMC",
             "PID (tuned)":             "PID_tuned",
             "PID (5 Hz)":              "PID_5_Hz",
             "NMPC offset-free (N=12)": "NMPC_offset-free_N12",
@@ -283,7 +302,18 @@ def _turn_labels():
 #  Figures
 # --------------------------------------------------------------------------- #
 def generate_figures(t, ref_deg, controllers, full_metrics, seg_data, out_dir):
-    """Generate all thesis-level figures in English."""
+    """Generate all thesis-level figures in English.
+
+    Every figure is written twice: the default name, and a variant with the
+    Fossen baseline toggled the other way ("_bez_fossen" = without,
+    "_ar_fossen" = with).  Defaults: with Fossen everywhere except the zooms,
+    where its tens-of-degrees error would flatten the other curves.
+    """
+    FOSSEN = "Fossen PID/SMC"
+
+    def _no_f(d):
+        return {k: v for k, v in d.items() if k != FOSSEN}
+
     # 1. Regime comparison
     regime_data = {}
     for name, fm in full_metrics.items():
@@ -296,11 +326,20 @@ def generate_figures(t, ref_deg, controllers, full_metrics, seg_data, out_dir):
         regime_data,
         os.path.join(out_dir, "thesis_regime_comparison.png"),
         title=T("thesis_regime_title"))
+    P.plot_regime_comparison(
+        _no_f(regime_data),
+        os.path.join(out_dir, "thesis_regime_comparison_bez_fossen.png"),
+        title=T("thesis_regime_title"))
 
     # 2. Error ECDF
+    err_data = {n: d["err_deg"] for n, d in controllers.items()}
     P.plot_error_ecdf(
-        {n: d["err_deg"] for n, d in controllers.items()},
+        err_data,
         os.path.join(out_dir, "thesis_error_ecdf.png"),
+        title=T("thesis_ecdf_title"))
+    P.plot_error_ecdf(
+        _no_f(err_data),
+        os.path.join(out_dir, "thesis_error_ecdf_bez_fossen.png"),
         title=T("thesis_ecdf_title"))
 
     # 3. Segment breakdown
@@ -309,54 +348,41 @@ def generate_figures(t, ref_deg, controllers, full_metrics, seg_data, out_dir):
         os.path.join(out_dir, "thesis_segment_breakdown.png"),
         turn_labels=_turn_labels(), metric="iae", unit="°·s",
         title=T("thesis_segment_title"))
+    P.plot_segment_breakdown(
+        _no_f(seg_data),
+        os.path.join(out_dir, "thesis_segment_breakdown_bez_fossen.png"),
+        turn_labels=_turn_labels(), metric="iae", unit="°·s",
+        title=T("thesis_segment_title"))
 
-    # 4. Reversal zoom
-    P.plot_spike_zoom(
-        t,
-        {n: d["heading_cont_deg"] for n, d in controllers.items()},
-        ref_deg,
-        WIN_REVERSAL,
-        os.path.join(out_dir, "thesis_zoom_reversal.png"),
-        title=T("thesis_zoom_rev_title"))
+    # 4 & 5. Zooms (default without Fossen; "_ar_fossen" variant with it)
+    heading_data = {n: d["heading_cont_deg"] for n, d in controllers.items()}
+    for win, base in ((WIN_REVERSAL, "thesis_zoom_reversal"),
+                      (WIN_DEPTH, "thesis_zoom_depthcoupling")):
+        ttl = T("thesis_zoom_rev_title") if base.endswith("reversal") \
+            else T("thesis_zoom_depth_title")
+        P.plot_spike_zoom(
+            t, _no_f(heading_data), ref_deg, win,
+            os.path.join(out_dir, f"{base}.png"), title=ttl)
+        P.plot_spike_zoom(
+            t, heading_data, ref_deg, win,
+            os.path.join(out_dir, f"{base}_ar_fossen.png"), title=ttl)
 
-    # 5. Depth-coupling zoom
-    P.plot_spike_zoom(
-        t,
-        {n: d["heading_cont_deg"] for n, d in controllers.items()},
-        ref_deg,
-        WIN_DEPTH,
-        os.path.join(out_dir, "thesis_zoom_depthcoupling.png"),
-        title=T("thesis_zoom_depth_title"))
-
-    # 6. Mission overview — annotate worst NMPC event in each window
-    nmpc_names = [n for n in controllers if "NMPC" in n]
-    if nmpc_names:
-        # pick the worse (original if available, else patched)
-        nmpc_name = next(
-            (n for n in nmpc_names if "traj" in n),
-            nmpc_names[-1])
-        err = controllers[nmpc_name]["err_deg"]
-        i_rev = int(np.argmax(np.abs(err)))
-        dep_mask = (t >= WIN_DEPTH[0]) & (t <= WIN_DEPTH[1])
-        i_dep_local = int(np.argmax(np.abs(err[dep_mask])))
-        i_dep = np.where(dep_mask)[0][i_dep_local]
-        events = [
-            (t[i_dep], err[i_dep],
-             "  " + T("event_depth_coupling").format(val=err[i_dep])),
-            (t[i_rev], err[i_rev],
-             "  " + T("event_reversal").format(val=err[i_rev])),
-        ]
-    else:
-        events = []
-
+    # 6. Mission overview
     P.plot_mission_overview(
         t,
-        {n: d["heading_cont_deg"] for n, d in controllers.items()},
+        heading_data,
         ref_deg,
-        {n: d["err_deg"] for n, d in controllers.items()},
+        err_data,
         SWITCH,
         os.path.join(out_dir, "thesis_mission_overview.png"),
-        events=events,
+        title=T("thesis_overview_title"))
+    P.plot_mission_overview(
+        t,
+        _no_f(heading_data),
+        ref_deg,
+        _no_f(err_data),
+        SWITCH,
+        os.path.join(out_dir, "thesis_mission_overview_bez_fossen.png"),
         title=T("thesis_overview_title"))
 
 
@@ -400,7 +426,8 @@ def generate_report(t, ref_deg, controllers, full_metrics, root_cause, stat_test
     """Write a comprehensive master's-level English Markdown report."""
 
     names = list(controllers)
-    pid_name  = next((n for n in names if "PID" in n), names[0])
+    # startswith, not substring: "Fossen PID/SMC" must not match here
+    pid_name  = next((n for n in names if n.startswith("PID")), names[0])
     nmpc_names = [n for n in names if "NMPC" in n]
     orig_name  = next((n for n in nmpc_names if "traj" in n), None)
     patch_name = next((n for n in nmpc_names if "offset" in n),
