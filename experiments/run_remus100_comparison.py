@@ -675,8 +675,21 @@ def print_heading_segment_analysis(result, switch_times, t_final, *, top_n: int 
         )
 
 
-def save_s6_heading_error_csv(results, out: str) -> str:
-    """Save time-history of heading and heading error for scenario 6."""
+def _safe_col(name: str) -> str:
+    """Controller name -> CSV column prefix (see analyze_s6.CONTROLLERS)."""
+    return (name
+            .replace(" ", "_")
+            .replace("(", "").replace(")", "")
+            .replace("=", "").replace("-", "-"))
+
+
+def save_s6_error_csv(results, out: str) -> str:
+    """Save time-history of heading and depth (plus their errors) for scenario 6.
+
+    Depth columns are appended after the heading block, so every consumer that
+    selects columns by name (analyze_s6, thesis_analysis) keeps working; they
+    are what lets the deep-dive analysis score depth as well as heading.
+    """
     path = os.path.join(out, "s6_kursa_kludas_analize.csv")
     base = results[0]
     ref_cont = heading_continuous_deg(base.eta_d[:, 5], anchor_deg=0.0)
@@ -685,15 +698,16 @@ def save_s6_heading_error_csv(results, out: str) -> str:
 
     headers = ["time_s", "reference_heading_deg", "reference_heading_continuous_deg"]
     for r in results:
-        safe = (r.controller_name
-                .replace(" ", "_")
-                .replace("(", "").replace(")", "")
-                .replace("=", "").replace("-", "-"))
+        safe = _safe_col(r.controller_name)
         headers += [
             f"{safe}_heading_deg",
             f"{safe}_heading_continuous_deg",
             f"{safe}_heading_error_deg",
         ]
+    headers.append("reference_depth_m")
+    for r in results:
+        safe = _safe_col(r.controller_name)
+        headers += [f"{safe}_depth_m", f"{safe}_depth_error_m"]
 
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -708,6 +722,10 @@ def save_s6_heading_error_csv(results, out: str) -> str:
                 row.append(f"{heading_deg(r.eta[i, 5]):.6f}")
                 row.append(f"{result_cont[id(r)][i]:.6f}")
                 row.append(f"{heading_error_deg(r.eta[i, 5], r.eta_d[i, 5]):.6f}")
+            row.append(f"{base.eta_d[i, 2]:.6f}")
+            for r in results:
+                row.append(f"{r.eta[i, 2]:.6f}")
+                row.append(f"{r.eta[i, 2] - r.eta_d[i, 2]:.6f}")
             writer.writerow(row)
 
     print(f"    Saved: {path}")
@@ -785,7 +803,7 @@ def scenario_6_complex(out):
         )
         print_heading_segment_analysis(r, switch_times, t_final)
 
-    save_s6_heading_error_csv(results, out)
+    save_s6_error_csv(results, out)
 
     # Save controller solve times for computational performance analysis.
     # NMPC runs at 5 Hz (dt_mpc=0.2 s); PID runs at 50 Hz (sampleTime=0.02 s).

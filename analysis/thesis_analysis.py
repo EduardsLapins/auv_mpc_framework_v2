@@ -299,6 +299,180 @@ def _turn_labels():
 
 
 # --------------------------------------------------------------------------- #
+#  Depth channel
+# --------------------------------------------------------------------------- #
+def load_depth_data():
+    """Load the depth time-series for the same run as load_data().
+
+    Returns ``(ref_depth_m, {name: {"depth_m", "err_m"}})``, or ``(None, None)``
+    when the CSVs predate the depth columns.  Source preference mirrors
+    load_data(): the 3-way patch CSV (which is the only place the original
+    trajectory NMPC is run) with the Fossen baseline merged in from the
+    scenario-6 CSV, falling back to the scenario-6 CSV alone.
+    """
+    import pandas as pd
+
+    three_way_path = os.path.join(OUTDIR, "patch_compare_timeseries.csv")
+    two_way_path   = os.path.join(RESULTS, "s6_kursa_kludas_analize.csv")
+
+    def _fossen_depth(n_rows):
+        if not os.path.exists(two_way_path):
+            return None
+        df6 = pd.read_csv(two_way_path)
+        pfx = "Fossen_PID/SMC"
+        if f"{pfx}_depth_m" not in df6.columns or len(df6) != n_rows:
+            return None
+        return {"depth_m": df6[f"{pfx}_depth_m"].values,
+                "err_m": df6[f"{pfx}_depth_error_m"].values}
+
+    if os.path.exists(three_way_path):
+        df = pd.read_csv(three_way_path)
+        if "reference_depth_m" in df.columns:
+            ctrl = {}
+            for n in ["PID (tuned)", "NMPC traj. (N=12)", "NMPC offset-free (N=12)"]:
+                if f"{n}_depth_m" in df.columns:
+                    ctrl[n] = {"depth_m": df[f"{n}_depth_m"].values,
+                               "err_m": df[f"{n}_depth_err_m"].values}
+            fossen = _fossen_depth(len(df))
+            if fossen is not None:
+                ctrl = {"Fossen PID/SMC": fossen, **ctrl}
+            return df["reference_depth_m"].values, ctrl
+
+    if os.path.exists(two_way_path):
+        df = pd.read_csv(two_way_path)
+        if "reference_depth_m" in df.columns:
+            col_map = {
+                "Fossen PID/SMC":          "Fossen_PID/SMC",
+                "PID (tuned)":             "PID_tuned",
+                "PID (5 Hz)":              "PID_5_Hz",
+                "NMPC offset-free (N=12)": "NMPC_offset-free_N12",
+            }
+            ctrl = {name: {"depth_m": df[f"{pfx}_depth_m"].values,
+                           "err_m": df[f"{pfx}_depth_error_m"].values}
+                    for name, pfx in col_map.items()
+                    if f"{pfx}_depth_m" in df.columns}
+            return df["reference_depth_m"].values, ctrl
+
+    return None, None
+
+
+def _depth_labels():
+    """Segment labels for the depth channel: the commanded depth change."""
+    labels = []
+    for k in range(len(BOUNDS) - 1):
+        if k == 0:
+            labels.append(T("seg_holding"))
+            continue
+        dz = WAYPOINTS[k][0] - WAYPOINTS[k - 1][0]
+        labels.append(T("seg_holding") if abs(dz) < 1e-6 else f"{dz:+.0f} m")
+    return labels
+
+
+def compute_depth_metrics(t, ref_depth, dctrl):
+    """Regime RMSE and per-segment decomposition for the depth channel.
+
+    Transients are keyed to the waypoints that actually change DEPTH, so a
+    pure heading turn is not scored as a depth manoeuvre.
+    """
+    changing = [WAYPOINTS[i + 1][0] != WAYPOINTS[i][0] for i in range(len(SWITCH))]
+    settled_mask = np.zeros(len(t), bool)
+    for a, b in zip(BOUNDS[:-1], BOUNDS[1:]):
+        settled_mask |= (t >= a + 0.6 * (b - a)) & (t < b)
+    trans_mask = np.zeros(len(t), bool)
+    for i, ts in enumerate(SWITCH):
+        if changing[i]:
+            trans_mask |= (t >= ts) & (t < ts + 35.0)
+
+    regimes, seg, rows_csv = {}, {}, []
+    for name, d in dctrl.items():
+        e = np.asarray(d["err_m"], float)
+
+        def _rmse(mask):
+            return float(np.sqrt(np.mean(e[mask] ** 2))) if mask.any() else float("nan")
+
+        regimes[name] = {
+            T("regime_aggregate"): _rmse(np.ones(len(t), bool)),
+            T("regime_transient"): _rmse(trans_mask),
+            T("regime_settled"):   _rmse(settled_mask),
+        }
+        seg[name] = M.segment_decompose(t, np.asarray(d["depth_m"], float),
+                                        np.asarray(ref_depth, float), BOUNDS,
+                                        angular=False, steady_frac=0.4)
+        ae = np.abs(e)
+        rows_csv.append({
+            "controller": name,
+            "rmse_m": regimes[name][T("regime_aggregate")],
+            "transient_rmse_m": regimes[name][T("regime_transient")],
+            "settled_rmse_m": regimes[name][T("regime_settled")],
+            "mae_m": float(np.mean(ae)),
+            "p95_m": float(np.percentile(ae, 95)),
+            "max_m": float(np.max(ae)),
+        })
+    return regimes, seg, rows_csv
+
+
+def generate_depth_figures(t, ref_depth, dctrl, regimes, seg, out_dir):
+    """Depth twins of the thesis heading figures ("_dzilums" file names)."""
+    FOSSEN = "Fossen PID/SMC"
+
+    def _no_f(d):
+        return {k: v for k, v in d.items() if k != FOSSEN}
+
+    P.plot_regime_comparison(
+        regimes, os.path.join(out_dir, "thesis_regime_comparison_dzilums.png"),
+        unit="m", ylabel=T("rmse_log_m"), title=T("thesis_regime_depth_title"))
+    P.plot_regime_comparison(
+        _no_f(regimes),
+        os.path.join(out_dir, "thesis_regime_comparison_dzilums_bez_fossen.png"),
+        unit="m", ylabel=T("rmse_log_m"), title=T("thesis_regime_depth_title"))
+
+    err_data = {n: d["err_m"] for n, d in dctrl.items()}
+    # linthresh 0.01 m: the heading default of 0.5 would flatten the NMPC curves.
+    P.plot_error_ecdf(
+        err_data, os.path.join(out_dir, "thesis_error_ecdf_dzilums.png"),
+        unit=" m", xlabel=T("depth_err_abs"), linthresh=0.01,
+        title=T("thesis_ecdf_depth_title"))
+    P.plot_error_ecdf(
+        _no_f(err_data),
+        os.path.join(out_dir, "thesis_error_ecdf_dzilums_bez_fossen.png"),
+        unit=" m", xlabel=T("depth_err_abs"), linthresh=0.01,
+        title=T("thesis_ecdf_depth_title"))
+
+    P.plot_segment_breakdown(
+        seg, os.path.join(out_dir, "thesis_segment_breakdown_dzilums.png"),
+        turn_labels=_depth_labels(), metric="iae", unit="m·s",
+        title=T("thesis_segment_depth_title"))
+    P.plot_segment_breakdown(
+        _no_f(seg),
+        os.path.join(out_dir, "thesis_segment_breakdown_dzilums_bez_fossen.png"),
+        turn_labels=_depth_labels(), metric="iae", unit="m·s",
+        title=T("thesis_segment_depth_title"))
+
+    depth_data = {n: d["depth_m"] for n, d in dctrl.items()}
+    for win, base, ttl in (
+        (WIN_REVERSAL, "thesis_zoom_reversal_dzilums", T("thesis_zoom_rev_depth_title")),
+        (WIN_DEPTH, "thesis_zoom_depthcoupling_dzilums", T("thesis_zoom_depth_dz_title")),
+    ):
+        P.plot_spike_zoom(t, _no_f(depth_data), ref_depth, win,
+                          os.path.join(out_dir, f"{base}.png"), title=ttl,
+                          unit="m", ylabel=T("depth_m"))
+        P.plot_spike_zoom(t, depth_data, ref_depth, win,
+                          os.path.join(out_dir, f"{base}_ar_fossen.png"), title=ttl,
+                          unit="m", ylabel=T("depth_m"))
+
+    P.plot_mission_overview(
+        t, depth_data, ref_depth, err_data, SWITCH,
+        os.path.join(out_dir, "thesis_mission_overview_dzilums.png"),
+        ylabel=T("depth_m"), err_ylabel=T("depth_error_m"),
+        title=T("thesis_overview_depth_title"))
+    P.plot_mission_overview(
+        t, _no_f(depth_data), ref_depth, _no_f(err_data), SWITCH,
+        os.path.join(out_dir, "thesis_mission_overview_dzilums_bez_fossen.png"),
+        ylabel=T("depth_m"), err_ylabel=T("depth_error_m"),
+        title=T("thesis_overview_depth_title"))
+
+
+# --------------------------------------------------------------------------- #
 #  Figures
 # --------------------------------------------------------------------------- #
 def generate_figures(t, ref_deg, controllers, full_metrics, seg_data, out_dir):
@@ -1006,6 +1180,20 @@ def main():
     print("[thesis_analysis] Generating figures...")
     generate_figures(t, ref_deg, controllers, full_metrics, seg_data, OUTDIR)
 
+    print("[thesis_analysis] Depth channel...")
+    ref_depth, depth_ctrl = load_depth_data()
+    depth_rows = None
+    if depth_ctrl:
+        d_regimes, d_seg, depth_rows = compute_depth_metrics(t, ref_depth, depth_ctrl)
+        generate_depth_figures(t, ref_depth, depth_ctrl, d_regimes, d_seg, OUTDIR)
+        R.write_csv(depth_rows,
+                    ["controller", "rmse_m", "transient_rmse_m", "settled_rmse_m",
+                     "mae_m", "p95_m", "max_m"],
+                    os.path.join(OUTDIR, "thesis_depth_metrics.csv"))
+    else:
+        print("  no depth columns in the CSVs — rerun run_remus100_comparison "
+              "and compare_nmpc_patch to get the depth figures")
+
     print("[thesis_analysis] Writing CSV tables...")
     write_metric_csvs(full_metrics, seg_data, stat_tests, OUTDIR)
 
@@ -1027,6 +1215,16 @@ def main():
               f"{fm['transient']['rmse']:>10.2f} "
               f"{fm['settled']['rmse']:>10.3f}")
     print("=" * 70)
+    if depth_rows:
+        print("\n  DEPTH RMSE SUMMARY (m)")
+        print(f"  {'Controller':35s} {'Aggregate':>10s} {'Transient':>10s} {'Settled':>10s}")
+        print("  " + "-" * 67)
+        for r in depth_rows:
+            print(f"  {r['controller']:35s} "
+                  f"{r['rmse_m']:>10.3f} "
+                  f"{r['transient_rmse_m']:>10.3f} "
+                  f"{r['settled_rmse_m']:>10.4f}")
+        print("=" * 70)
     if stat_tests:
         print("\n  STATISTICAL TESTS (per-segment MAE, n=9 segments)")
         for cmp in stat_tests:

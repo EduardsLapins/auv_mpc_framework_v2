@@ -37,6 +37,9 @@ _STRINGS: dict[str, dict[str, str]] = {
     "cum_hdg_err":           {"en": "Cumulative heading error [°·s]", "lv": "Kumulatīvā kursa kļūda [°·s]"},
     "ctrl_surface_angles":   {"en": "Control surface angles [°]",     "lv": "Stūres leņķis [°]"},
     "hdg_err_abs":           {"en": "|Heading error| [°]",    "lv": "|kursa kļūda| [°]"},
+    "depth_error_m":         {"en": "Depth error [m]",        "lv": "Dziļuma kļūda [m]"},
+    "depth_err_abs":         {"en": "|Depth error| [m]",      "lv": "|dziļuma kļūda| [m]"},
+    "rmse_log_m":            {"en": "RMSE [m] (log scale)",   "lv": "RMSE [m] (logaritmiskā ass)"},
     "solve_time_ms":         {"en": "Solver time [ms]",       "lv": "Aprēķina laiks [ms]"},
     "solve_count":           {"en": "Solve count",            "lv": "Risinājumu skaits"},
     "cum_prob":              {"en": "Cumulative probability",  "lv": "Kumulatīvā varbūtība"},
@@ -137,6 +140,19 @@ _STRINGS: dict[str, dict[str, str]] = {
     "thesis_overview_title":  {"en": "Scenario 6: Heading over 600 s complex mission",
                                "lv": "6. scenārijs: Kurss 600 s sarežģītā misijā"},
 
+    # ---- thesis_analysis: depth-channel twins ----
+    "thesis_regime_depth_title":  {"en": "Depth RMSE by regime: aggregate masks the true controller ranking",
+                                   "lv": "Dziļuma RMSE pa darbības režīmiem: kopējā vērtība slēpj patieso secību"},
+    "thesis_ecdf_depth_title":    {"en": "Depth error ECDF — heavy-tail behaviour",
+                                   "lv": "Dziļuma kļūdas ECDF — smagās astes"},
+    "thesis_segment_depth_title": {"en": "Depth IAE by mission segment",
+                                   "lv": "Dziļuma IAE pa misijas posmiem"},
+    "thesis_zoom_rev_depth_title":  {"en": "Depth during the sharp heading reversal (495–560 s)",
+                                     "lv": "Dziļums ass pagrieziena laikā (495–560 s)"},
+    "thesis_zoom_depth_dz_title":   {"en": "Depth during the 40→10 m ascent (255–310 s)",
+                                     "lv": "Dziļums 40→10 m manevra laikā (255–310 s)"},
+    "thesis_overview_depth_title":  {"en": "Scenario 6: Depth over 600 s complex mission",
+                                     "lv": "6. scenārijs: Dziļums 600 s sarežģītā misijā"},
     # ---- figure titles ----
     "steady_vs_transient_title":  {"en": "Steady-state vs. transient tracking error",
                                    "lv": "Miera stāvokļa un pārejas režīma kļūdas"},
@@ -160,6 +176,15 @@ _STRINGS: dict[str, dict[str, str]] = {
     # ---- analyze_s6 figure titles / notes ----
     "s6_regime_title":     {"en": "Heading RMSE by regime: aggregate masks the regime switch",
                             "lv": "Kursa RMSE pa darbības režīmiem"},
+    # ---- depth counterparts of the scenario-6 deep-dive figures ----
+    "s6_regime_depth_title":  {"en": "Depth RMSE by operating regime",
+                               "lv": "Dziļuma RMSE pa darbības režīmiem"},
+    "s6_segment_depth_title": {"en": "Depth error by mission segment",
+                               "lv": "Dziļuma kļūdas sadalījums pa misijas posmiem"},
+    "s6_ecdf_depth_title":    {"en": "Depth error empirical CDF",
+                               "lv": "Dziļuma kļūdas sadalījuma funkcija (ECDF)"},
+    "s6_overview_depth_title": {"en": "Complex mission: depth and depth error",
+                                "lv": "Sarežģīta misija: dziļums un dziļuma kļūda"},
     "s6_zoom_rev_title":   {"en": "Sharp heading reversal (330°→45°→0°)",
                             "lv": "Ass pagrieziens (330°→45°→0°)"},
     "s6_zoom_rev_note":    {"en": "With reference preview the NMPC follows the turn almost exactly; "
@@ -184,6 +209,16 @@ _STRINGS: dict[str, dict[str, str]] = {
                                "lv": "Kursa novirze dziļuma manevra laikā (255–310 s): sākotnējais pret uzlaboto"},
     "patch_zoom_rev_title":   {"en": "Sharp reversal (495–560 s): original vs. patched",
                                "lv": "Ass pagrieziens (495–560 s): sākotnējais pret uzlaboto"},
+
+    # ---- compare_nmpc_patch: depth-channel twins ----
+    "patch_regime_depth_title":  {"en": "Depth RMSE by regime: original vs. patched NMPC",
+                                  "lv": "Dziļuma RMSE pa darbības režīmiem: sākotnējais pret uzlaboto NMPC"},
+    "patch_segment_depth_title": {"en": "Depth error by mission segment: original vs. patched NMPC",
+                                  "lv": "Dziļuma kļūda pa misijas posmiem: sākotnējais pret uzlaboto NMPC"},
+    "patch_zoom_depth_dz_title": {"en": "Depth tracking during the 40→10 m ascent (255–310 s): original vs. patched",
+                                  "lv": "Dziļuma noturēšana 40→10 m manevra laikā (255–310 s): sākotnējais pret uzlaboto"},
+    "patch_zoom_rev_dz_title":   {"en": "Depth tracking during the sharp reversal (495–560 s): original vs. patched",
+                                  "lv": "Dziļuma noturēšana ass pagrieziena laikā (495–560 s): sākotnējais pret uzlaboto"},
 
     # ---- solver timing timeline (thesis_analysis) ----
     "timing_timeline_title": {"en": "Controller Compute Time — Scenario 6 (600 s mission)\n"
@@ -220,6 +255,11 @@ _STRINGS: dict[str, dict[str, str]] = {
     "col_aggregate_rmse":    {"en": "Aggregate RMSE [°]",     "lv": "Kopējā RMSE [°]"},
     "col_transient_rmse":    {"en": "Transient RMSE [°]",     "lv": "Pārejas RMSE [°]"},
     "col_settled_rmse":      {"en": "Settled RMSE [°]",       "lv": "Miera stāvokļa RMSE [°]"},
+    # metre-unit twins for the depth channel tables
+    "col_max_e_m":           {"en": "max |e| [m]",            "lv": "maks |e| [m]"},
+    "col_aggregate_rmse_m":  {"en": "Aggregate RMSE [m]",     "lv": "Kopējā RMSE [m]"},
+    "col_transient_rmse_m":  {"en": "Transient RMSE [m]",     "lv": "Pārejas RMSE [m]"},
+    "col_settled_rmse_m":    {"en": "Settled RMSE [m]",       "lv": "Miera stāvokļa RMSE [m]"},
     "col_metric":            {"en": "Metric",                 "lv": "Mērījums"},
     "col_improvement":       {"en": "Improvement [%]",        "lv": "Uzlabojums [%]"},
 }

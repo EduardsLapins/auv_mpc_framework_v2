@@ -4,7 +4,7 @@
 
 Identical Scenario-6 mission with three controllers. The patched NMPC adds an offset-free yaw disturbance observer (for depth-coupling drift), a heavier terminal yaw-rate penalty, and a longer horizon (for reversal overshoot).
 
-Patched NMPC (N=12) solver time: mean 13.0 ms, P99 24.9 ms, max 55.3 ms; 100.0% of solves within deadline (200 ms).
+Patched NMPC (N=12) solver time: mean 13.0 ms, P99 24.6 ms, max 68.9 ms; 100.0% of solves within deadline (200 ms).
 
 ## Results
 

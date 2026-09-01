@@ -83,11 +83,23 @@ def _turn_labels(bounds):
     return labels
 
 
+def _depth_labels(bounds):
+    """Segment labels for the depth channel: the commanded depth change."""
+    labels = []
+    for k in range(len(bounds) - 1):
+        if k == 0:
+            labels.append(T("seg_holding"))
+            continue
+        dz = WAYPOINTS[k][0] - WAYPOINTS[k - 1][0]
+        labels.append(T("seg_holding") if abs(dz) < 1e-6 else f"{dz:+.0f} m")
+    return labels
+
+
 # --------------------------------------------------------------------------- #
 #  Run the three controllers on the mission
 # --------------------------------------------------------------------------- #
 def _run(t_final: float):
-    """Return ref + per-controller heading series. Needs casadi."""
+    """Return ref + per-controller heading AND depth series. Needs casadi."""
     try:
         import casadi  # noqa: F401
     except Exception as exc:
@@ -135,6 +147,7 @@ def _run(t_final: float):
 
     t = np.asarray(r_pid.time, float)
     ref_cont = heading_continuous_deg(r_pid.eta_d[:, 5], anchor_deg=0.0)
+    ref_depth = np.asarray(r_pid.eta_d[:, 2], float)
 
     solve = {}
     for name, res, ctrl in [
@@ -149,18 +162,29 @@ def _run(t_final: float):
                 heading_error_deg(res.eta[i, 5], res.eta_d[i, 5])
                 for i in range(len(t))
             ], float),
+            "depth_m": np.asarray(res.eta[:, 2], float),
+            "err_m": np.asarray(res.eta[:, 2] - res.eta_d[:, 2], float),
         }
         solve[name] = list(getattr(ctrl, "solve_times", []))
 
-    return t, ref_cont, runs, solve
+    return t, ref_cont, ref_depth, runs, solve
 
 
 # --------------------------------------------------------------------------- #
 #  Metrics
 # --------------------------------------------------------------------------- #
-def _compute_metrics(t, ref_cont_deg, runs, bounds):
-    ref_rad = ref_cont_deg * D2R
-    changing = [WAYPOINTS[i + 1][1] != WAYPOINTS[i][1]
+def _compute_metrics(t, ref, runs, bounds, *, key="heading_cont_deg",
+                     angular=True, in_scale=D2R, out_scale=R2D, wp_index=1):
+    """Aggregate / regime / per-segment metrics for one tracked channel.
+
+    ``key`` selects the series in ``runs`` (heading or depth); ``in_scale``
+    converts it into the unit the metric functions work in (deg->rad for
+    heading, 1.0 for depth) and ``out_scale`` converts back for reporting.
+    ``wp_index`` picks the waypoint component that decides which switches are
+    real manoeuvres for this channel — 0 = depth, 1 = heading.
+    """
+    ref_s = np.asarray(ref, float) * in_scale
+    changing = [WAYPOINTS[i + 1][wp_index] != WAYPOINTS[i][wp_index]
                 for i in range(len([s for s in SWITCH if s < bounds[-1]]))]
     active_switch = [s for s in SWITCH if s < bounds[-1]]
 
@@ -170,24 +194,24 @@ def _compute_metrics(t, ref_cont_deg, runs, bounds):
 
     regimes, agg, seg = {}, {}, {}
     for name, d in runs.items():
-        sig_rad = d["heading_cont_deg"] * D2R
-        e = M.angle_error(sig_rad, ref_rad) * R2D
-        tm = M.tracking_metrics(t, sig_rad, ref_rad, angular=True)
-        sp = M.split_transient_steady(t, sig_rad, ref_rad, active_switch,
-                                      angular=True, transient_window=35.0,
+        sig = np.asarray(d[key], float) * in_scale
+        e = (M.angle_error(sig, ref_s) if angular else (sig - ref_s)) * out_scale
+        tm = M.tracking_metrics(t, sig, ref_s, angular=angular)
+        sp = M.split_transient_steady(t, sig, ref_s, active_switch,
+                                      angular=angular, transient_window=35.0,
                                       only_changing=changing)
-        agg[name] = {"rmse": tm.rmse * R2D, "mae": tm.mae * R2D,
-                     "max": tm.max_abs * R2D, "iae": tm.iae * R2D}
+        agg[name] = {"rmse": tm.rmse * out_scale, "mae": tm.mae * out_scale,
+                     "max": tm.max_abs * out_scale, "iae": tm.iae * out_scale}
         regimes[name] = {
             T("regime_aggregate"): float(np.sqrt(np.mean(e ** 2))),
-            T("regime_transient"): sp["transient_rmse"] * R2D,
+            T("regime_transient"): sp["transient_rmse"] * out_scale,
             T("regime_settled"):   float(np.sqrt(np.mean(e[settled_mask] ** 2))),
         }
-        rows = M.segment_decompose(t, sig_rad, ref_rad, bounds, angular=True,
+        rows = M.segment_decompose(t, sig, ref_s, bounds, angular=angular,
                                    steady_frac=0.4)
         for rr in rows:
             for k in ("iae", "mae", "rmse", "max_abs", "steady_state"):
-                rr[k] *= R2D
+                rr[k] *= out_scale
         seg[name] = rows
     return agg, regimes, seg
 
@@ -204,30 +228,32 @@ def _window_peak(t, runs, window):
 # --------------------------------------------------------------------------- #
 #  Before/after zoom overlay
 # --------------------------------------------------------------------------- #
-def _zoom_overlay(t, ref_cont_deg, runs, window, path, *, title):
+def _zoom_overlay(t, ref, runs, window, path, *, title, key="heading_cont_deg",
+                  err_key="err_deg", ylabel=None, err_ylabel=None):
     P.setup_style()
     import matplotlib.pyplot as plt
     a, b = window
     mask = (t >= a) & (t < b)
+    ref = np.asarray(ref, float)
     fig, (ax_h, ax_e) = plt.subplots(2, 1, figsize=(11, 7.2), sharex=True,
                                      gridspec_kw={"height_ratios": [2, 1]})
-    ax_h.plot(t[mask], ref_cont_deg[mask], color=COL["reference"], lw=1.6,
+    ax_h.plot(t[mask], ref[mask], color=COL["reference"], lw=1.6,
               ls="--", label=T("reference"))
     for name in runs:
-        ax_h.plot(t[mask], runs[name]["heading_cont_deg"][mask],
+        ax_h.plot(t[mask], np.asarray(runs[name][key], float)[mask],
                   color=COL.get(name, P.controller_color(name)), lw=2.0,
                   label=name)
-    ax_h.set_ylabel(T("hdg_continuous"))
+    ax_h.set_ylabel(ylabel or T("hdg_continuous"))
     # absolute tick labels (e.g. 200.05), not matplotlib's "+2e2" offset form
     ax_h.ticklabel_format(axis="y", useOffset=False)
     ax_h.set_title(title, fontsize=12, fontweight="bold")
     ax_h.legend(loc="best")
 
     for name in runs:
-        e = np.abs(runs[name]["err_deg"][mask])
+        e = np.abs(np.asarray(runs[name][err_key], float)[mask])
         ax_e.plot(t[mask], e, color=COL.get(name, P.controller_color(name)),
                   lw=1.8, label=name)
-    ax_e.set_ylabel(T("hdg_err_abs"))
+    ax_e.set_ylabel(err_ylabel or T("hdg_err_abs"))
     ax_e.set_xlabel(T("time_s"))
     ax_e.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -252,9 +278,12 @@ def main(argv=None):
 
     print(f"[compare_nmpc_patch] running mission to t={t_final:.0f}s "
           f"(current {V_C} m/s @ {BETA_C}°)")
-    t, ref_cont, runs, solve = _run(t_final)
+    t, ref_cont, ref_depth, runs, solve = _run(t_final)
 
     agg, regimes, seg = _compute_metrics(t, ref_cont, runs, bounds)
+    d_agg, d_regimes, d_seg = _compute_metrics(
+        t, ref_depth, runs, bounds, key="depth_m", angular=False,
+        in_scale=1.0, out_scale=1.0, wp_index=0)
     peak_depth = _window_peak(t, runs, WIN_DEPTH)
     peak_rev   = _window_peak(t, runs, WIN_REVERSAL) if not args.quick else None
 
@@ -266,18 +295,36 @@ def main(argv=None):
         seg, os.path.join(args.out, "patch_segment_breakdown.png"),
         turn_labels=_turn_labels(bounds), metric="iae", unit="°·s")
 
-    figs = [f_regime, f_seg]
+    f_regime_z = P.plot_regime_comparison(
+        d_regimes, os.path.join(args.out, "patch_regime_comparison_dzilums.png"),
+        unit="m", ylabel=T("rmse_log_m"), title=T("patch_regime_depth_title"))
+    f_seg_z = P.plot_segment_breakdown(
+        d_seg, os.path.join(args.out, "patch_segment_breakdown_dzilums.png"),
+        turn_labels=_depth_labels(bounds), metric="iae", unit="m·s",
+        title=T("patch_segment_depth_title"))
+
+    figs = [f_regime, f_seg, f_regime_z, f_seg_z]
     f_depth = _zoom_overlay(
         t, ref_cont, runs, WIN_DEPTH,
         os.path.join(args.out, "patch_zoom_depthcoupling.png"),
         title=T("patch_zoom_depth_title"))
     figs.append(f_depth)
+    figs.append(_zoom_overlay(
+        t, ref_depth, runs, WIN_DEPTH,
+        os.path.join(args.out, "patch_zoom_depthcoupling_dzilums.png"),
+        title=T("patch_zoom_depth_dz_title"), key="depth_m", err_key="err_m",
+        ylabel=T("depth_m"), err_ylabel=T("depth_err_abs")))
     if not args.quick:
         f_rev = _zoom_overlay(
             t, ref_cont, runs, WIN_REVERSAL,
             os.path.join(args.out, "patch_zoom_reversal.png"),
             title=T("patch_zoom_rev_title"))
         figs.append(f_rev)
+        figs.append(_zoom_overlay(
+            t, ref_depth, runs, WIN_REVERSAL,
+            os.path.join(args.out, "patch_zoom_reversal_dzilums.png"),
+            title=T("patch_zoom_rev_dz_title"), key="depth_m", err_key="err_m",
+            ylabel=T("depth_m"), err_ylabel=T("depth_err_abs")))
 
     # ---- "_ar_fossen" figure variants: merge the Fossen baseline from the
     # scenario-6 CSV (same seed-6 current realisation, same 50 Hz grid) ----
@@ -289,14 +336,17 @@ def main(argv=None):
         pfx = "Fossen_PID/SMC"
         if (f"{pfx}_heading_continuous_deg" in df6.columns
                 and len(df6) == len(t)):
-            runs_f = {
-                "Fossen PID/SMC": {
-                    "t": t,
-                    "heading_cont_deg": df6[f"{pfx}_heading_continuous_deg"].values,
-                    "err_deg": df6[f"{pfx}_heading_error_deg"].values,
-                },
-                **runs,
+            fossen = {
+                "t": t,
+                "heading_cont_deg": df6[f"{pfx}_heading_continuous_deg"].values,
+                "err_deg": df6[f"{pfx}_heading_error_deg"].values,
             }
+            # Depth columns only exist in CSVs written after the depth channel
+            # was added; without them the Fossen depth variants are skipped.
+            if f"{pfx}_depth_m" in df6.columns:
+                fossen["depth_m"] = df6[f"{pfx}_depth_m"].values
+                fossen["err_m"] = df6[f"{pfx}_depth_error_m"].values
+            runs_f = {"Fossen PID/SMC": fossen, **runs}
     if runs_f is not None:
         agg_f, regimes_f, seg_f = _compute_metrics(t, ref_cont, runs_f, bounds)
         P.plot_regime_comparison(
@@ -316,6 +366,34 @@ def main(argv=None):
                 t, ref_cont, runs_f, WIN_REVERSAL,
                 os.path.join(args.out, "patch_zoom_reversal_ar_fossen.png"),
                 title=T("patch_zoom_rev_title"))
+
+        if "depth_m" in runs_f["Fossen PID/SMC"]:
+            _, d_regimes_f, d_seg_f = _compute_metrics(
+                t, ref_depth, runs_f, bounds, key="depth_m", angular=False,
+                in_scale=1.0, out_scale=1.0, wp_index=0)
+            P.plot_regime_comparison(
+                d_regimes_f,
+                os.path.join(args.out, "patch_regime_comparison_dzilums_ar_fossen.png"),
+                unit="m", ylabel=T("rmse_log_m"), title=T("patch_regime_depth_title"))
+            P.plot_segment_breakdown(
+                d_seg_f,
+                os.path.join(args.out, "patch_segment_breakdown_dzilums_ar_fossen.png"),
+                turn_labels=_depth_labels(bounds), metric="iae", unit="m·s",
+                title=T("patch_segment_depth_title"))
+            _zoom_overlay(
+                t, ref_depth, runs_f, WIN_DEPTH,
+                os.path.join(args.out, "patch_zoom_depthcoupling_dzilums_ar_fossen.png"),
+                title=T("patch_zoom_depth_dz_title"), key="depth_m", err_key="err_m",
+                ylabel=T("depth_m"), err_ylabel=T("depth_err_abs"))
+            if not args.quick:
+                _zoom_overlay(
+                    t, ref_depth, runs_f, WIN_REVERSAL,
+                    os.path.join(args.out, "patch_zoom_reversal_dzilums_ar_fossen.png"),
+                    title=T("patch_zoom_rev_dz_title"), key="depth_m", err_key="err_m",
+                    ylabel=T("depth_m"), err_ylabel=T("depth_err_abs"))
+        else:
+            print("[compare_nmpc_patch] s6 CSV has no depth columns — "
+                  "skipping the Fossen depth variants")
     else:
         print("[compare_nmpc_patch] no matching Fossen data in s6 CSV — "
               "skipping _ar_fossen figure variants")
@@ -328,11 +406,17 @@ def main(argv=None):
         names = list(runs)
         w.writerow(["time_s", "reference_cont_deg"]
                    + [f"{n}_cont_deg" for n in names]
-                   + [f"{n}_err_deg" for n in names])
+                   + [f"{n}_err_deg" for n in names]
+                   + ["reference_depth_m"]
+                   + [f"{n}_depth_m" for n in names]
+                   + [f"{n}_depth_err_m" for n in names])
         for i in range(len(t)):
             w.writerow([f"{t[i]:.3f}", f"{ref_cont[i]:.6f}"]
                        + [f"{runs[n]['heading_cont_deg'][i]:.6f}" for n in names]
-                       + [f"{runs[n]['err_deg'][i]:.6f}" for n in names])
+                       + [f"{runs[n]['err_deg'][i]:.6f}" for n in names]
+                       + [f"{ref_depth[i]:.6f}"]
+                       + [f"{runs[n]['depth_m'][i]:.6f}" for n in names]
+                       + [f"{runs[n]['err_m'][i]:.6f}" for n in names])
 
     # ---- summary table ----
     o = "NMPC traj. (N=12)"

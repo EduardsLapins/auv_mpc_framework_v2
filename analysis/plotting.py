@@ -106,6 +106,7 @@ def plot_steady_vs_transient(
     path: str,
     *,
     unit: str = "°",
+    ylabel: str | None = None,
     title: str | None = None,
 ):
     """Grouped bars: transient RMSE vs steady-state RMSE per controller.
@@ -131,7 +132,7 @@ def plot_steady_vs_transient(
                 color=[controller_color(n) for n in names], edgecolor="white")
 
     ax.set_yscale("log")
-    ax.set_ylabel(T("rmse_log"))
+    ax.set_ylabel(ylabel or T("rmse_log"))
     ax.set_xticks(x)
     ax.set_xticklabels(names)
     ax.set_title(title)
@@ -157,6 +158,7 @@ def plot_regime_comparison(
     *,
     regime_order: Sequence[str] | None = None,
     unit: str = "°",
+    ylabel: str | None = None,
     title: str | None = None,
 ):
     """Grouped bars of an error metric across operating regimes per controller.
@@ -184,12 +186,12 @@ def plot_regime_comparison(
             ax.text(r.get_x() + r.get_width() / 2, h * 1.04, f"{h:.2f}",
                     ha="center", va="bottom", fontsize=8)
     ax.set_yscale("log")
-    ax.set_ylabel(T("rmse_log"))
+    ax.set_ylabel(ylabel or T("rmse_log"))
     ax.set_xticks(x)
     ax.set_xticklabels(regimes)
-    ax.set_ylim(top=ax.get_ylim()[1] * 2.2)
+    ax.set_ylim(top=ax.get_ylim()[1] * 6.0)
     ax.set_title(title)
-    ax.legend(loc="upper right")
+    ax.legend(loc="upper right", framealpha=0.95)
     ax.grid(axis="x", visible=False)
     fig.tight_layout()
     fig.savefig(path, dpi=200, bbox_inches="tight")
@@ -255,6 +257,8 @@ def plot_error_ecdf(
     path: str,
     *,
     unit: str = "°",
+    xlabel: str | None = None,
+    linthresh: float = 0.5,
     title: str | None = None,
 ):
     """Empirical CDF of |error| for each controller.
@@ -272,13 +276,14 @@ def plot_error_ecdf(
         ax.plot(ae, cdf, label=n, color=controller_color(n), lw=2)
         p95 = np.percentile(ae, 95)
         ax.scatter([p95], [0.95], color=controller_color(n), zorder=5, s=28)
-        ax.annotate(f"P95 = {p95:.1f}{unit}", (p95, 0.95),
+        nd = 1 if p95 >= 1.0 else 3
+        ax.annotate(f"P95 = {p95:.{nd}f}{unit}", (p95, 0.95),
                     textcoords="offset points", xytext=(7, -14 - 12 * j),
                     fontsize=8, color=controller_color(n))
     ax.axhline(0.95, color="#9aa0a6", ls=":", lw=1, alpha=0.7)
-    ax.set_xlabel(T("hdg_err_abs"))
+    ax.set_xlabel(xlabel or T("hdg_err_abs"))
     ax.set_ylabel(T("cum_prob"))
-    ax.set_xscale("symlog", linthresh=0.5)
+    ax.set_xscale("symlog", linthresh=linthresh)
     ax.set_xlim(left=0)
     ax.set_ylim(0, 1.02)
     ax.set_title(title)
@@ -350,9 +355,11 @@ def plot_mission_overview(
     path: str,
     *,
     events: Sequence[tuple[float, float, str]] = (),
+    ylabel: str | None = None,
+    err_ylabel: str | None = None,
     title: str | None = None,
 ):
-    """Two-panel mission overview: tracked heading (top), error (bottom).
+    """Two-panel mission overview: tracked signal (top), error (bottom).
 
     Cleaner than stacking six panels: segment switches are light vertical
     guides, and ``events`` (t, value, label) annotate notable excursions on the
@@ -369,14 +376,14 @@ def plot_mission_overview(
              lw=1.4, alpha=0.9, label=T("reference"))
     for n, h in heading_by_controller.items():
         ax0.plot(t, np.asarray(h, float), color=controller_color(n), lw=1.6, label=n)
-    ax0.set_ylabel(T("heading_deg"))
+    ax0.set_ylabel(ylabel or T("heading_deg"))
     ax0.set_title(title)
     ax0.legend(loc="upper left", ncol=3)
 
     ax1.axhline(0, color="#9aa0a6", lw=1, alpha=0.7)
     for n, e in error_by_controller.items():
         ax1.plot(t, np.asarray(e, float), color=controller_color(n), lw=1.3, label=n)
-    ax1.set_ylabel(T("heading_error_deg"))
+    ax1.set_ylabel(err_ylabel or T("heading_error_deg"))
     ax1.set_xlabel(T("time_s"))
     ax1.legend(loc="upper left", ncol=2)
 
