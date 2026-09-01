@@ -227,7 +227,9 @@ class FossenVehicleAdapter:
                                n_d: float = 1525, V_c: float = 0.5,
                                beta_c: float = 170,
                                disturbance_fn: Callable = None,
-                               reference_fn: Callable = None) -> SimulationResult:
+                               reference_fn: Callable = None,
+                               eta0: np.ndarray = None,
+                               nu0: np.ndarray = None) -> SimulationResult:
         """
         Run with Fossen's built-in depth+heading autopilot for baseline comparison.
 
@@ -238,6 +240,11 @@ class FossenVehicleAdapter:
         autopilot the same time-varying setpoints the other controllers track
         (the vehicle reads ref_z [m] and ref_psi [deg] each step); z_d/psi_d
         then only seed the initial setpoint.
+        ``eta0``/``nu0`` set the initial pose / body velocities (default: zeros,
+        i.e. surfaced and at rest).  When ``eta0`` is given, the autopilot's own
+        depth LP filter and heading reference model are seeded from it as well,
+        so the baseline starts trimmed at that state instead of ramping its
+        internal references up from zero.
         """
         # Create a fresh vehicle with the autopilot configured
         vehicle = remus100('depthHeadingAutopilot', z_d, psi_d, n_d, V_c, beta_c)
@@ -245,9 +252,15 @@ class FossenVehicleAdapter:
         dt = self.sampleTime
         N = int(t_final / dt)
 
-        eta = np.zeros(6, float)
-        nu = vehicle.nu.copy()
+        eta = eta0.copy() if eta0 is not None else np.zeros(6, float)
+        nu = nu0.copy() if nu0 is not None else vehicle.nu.copy()
         u_actual = vehicle.u_actual.copy()
+
+        if eta0 is not None:
+            # Seed the autopilot's internal reference states so it does not fight
+            # a spurious 0 -> eta0 transient over the first steps.
+            vehicle.z_d = float(eta[2])
+            vehicle.psi_d = float(eta[5])
 
         time_log = np.zeros(N)
         eta_log = np.zeros((N, 6))

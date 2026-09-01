@@ -526,7 +526,13 @@ def write_scenario_metrics_csv(out: str) -> str:
     return path
 
 
-def run_three(t_final, z_d, psi_d, Vc, bc, ref, tag, out, title, *, seed=0):
+def run_three(t_final, z_d, psi_d, Vc, bc, ref, tag, out, title, *, seed=0,
+              eta0=None, nu0=None):
+    """Run the three-controller comparison for one scenario.
+
+    ``eta0``/``nu0`` optionally start every controller from the same non-zero
+    initial state (e.g. already at depth), instead of surfaced and at rest.
+    """
     # Every scenario runs against a seeded time-varying current realisation
     # (identical for all three controllers); controllers only know the mean.
     dist = varying_current(seed, t_final, Vc, bc)
@@ -535,22 +541,24 @@ def run_three(t_final, z_d, psi_d, Vc, bc, ref, tag, out, title, *, seed=0):
     print("    Fossen autopilot...")
     a = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
     r1 = a.run_builtin_autopilot(t_final, z_d, psi_d, 1525, Vc, bc,
-                                 disturbance_fn=dist, reference_fn=ref)
+                                 disturbance_fn=dist, reference_fn=ref,
+                                 eta0=eta0, nu0=nu0)
     r1.controller_name = "Fossen PID/SMC"
     results.append(r1)
 
     print("    Tuned PID (50 Hz)...")
     pid = make_pid()
     a2 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
-    r2 = a2.run(t_final, wrap_pid(pid), ref, sampleTime=0.02, disturbance_fn=dist)
+    r2 = a2.run(t_final, wrap_pid(pid), ref, eta0=eta0, nu0=nu0,
+                sampleTime=0.02, disturbance_fn=dist)
     r2.controller_name = "PID (tuned)"
     results.append(r2)
 
     print("    NMPC...")
     nmpc = make_nmpc(Vc, bc)
     a3 = FossenVehicleAdapter(V_current=Vc, beta_current=bc)
-    r3 = a3.run(t_final, wrap_nmpc(nmpc, ref), ref, sampleTime=0.02,
-                disturbance_fn=dist)
+    r3 = a3.run(t_final, wrap_nmpc(nmpc, ref), ref, eta0=eta0, nu0=nu0,
+                sampleTime=0.02, disturbance_fn=dist)
     r3.controller_name = nmpc.name
     results.append(r3)
 
@@ -591,16 +599,24 @@ def scenario_2(out):
         )
 
 
+S3_DEPTH = 20.0   # scenario 3 runs entirely at this depth
+
+
 def scenario_3(out):
+    """Pure heading manoeuvres: the vehicle starts trimmed at S3_DEPTH and the
+    depth reference is held constant, so nothing in the depth channel (dive
+    pitch, stern-plane action) can contaminate the yaw response."""
     print("\n" + "=" * 70 + "\n  SCENARIO 3: Large heading changes\n" + "=" * 70)
+    eta0 = np.array([0.0, 0.0, S3_DEPTH, 0.0, 0.0, 0.0])
     for j, pd in enumerate([90, 180]):
-        print(f"\n  Heading: 0 -> {pd} deg")
+        print(f"\n  Heading: 0 -> {pd} deg (constant depth {S3_DEPTH:.0f} m)")
         run_three(
-            200, 20, pd, 0.3, 90,
-            smooth_ref([(0, 0), (20, pd)], [2.0], tau_rise=15.0),
+            200, S3_DEPTH, pd, 0.3, 90,
+            smooth_ref([(S3_DEPTH, 0), (S3_DEPTH, pd)], [2.0], tau_rise=15.0),
             f"s3_kurss{pd}", out,
             T("s3_title").format(pd=pd),
             seed=31 + j,
+            eta0=eta0,
         )
 
 
